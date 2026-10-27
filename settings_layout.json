@@ -1,0 +1,100 @@
+{
+  "pages": [
+    {
+      "id": "capture",
+      "title": "Снимки",
+      "icon": "snip",
+      "items": [
+        "snip_save",
+        "snip_dir",
+        "snip_name",
+        "copy_on_close"
+      ]
+    },
+    {
+      "id": "gif",
+      "title": "Запись GIF",
+      "icon": "film",
+      "items": [
+        "gif_save",
+        "gif_dir",
+        "fps",
+        "gif_scale",
+        "gif_cursor",
+        "gif_name"
+      ]
+    },
+    {
+      "id": "appearance",
+      "title": "Внешний вид",
+      "icon": "palette",
+      "items": [
+        "theme",
+        "ui_scale",
+        "titlebar"
+      ]
+    },
+    {
+      "id": "user_1",
+      "title": "Windows",
+      "icon": "settings",
+      "items": [
+        "tray",
+        "autostart"
+      ]
+    },
+    {
+      "id": "hotkeys",
+      "title": "Клавиши",
+      "icon": "keyboard",
+      "items": [
+        "hk_full",
+        {
+          "section": "Быстрые действия"
+        },
+        "hk_snip",
+        "hk_gif",
+        "hotkey_silent",
+        "shortcuts"
+      ]
+    }
+  ],
+  "texts": {
+    "gif_save": {
+      "description": "Если выкл, GIF сохраняется только в буфер обмена"
+    },
+    "gif_scale": {
+      "description": "Уменьшение размера и веса кадра"
+    },
+    "hotkey_silent": {
+      "title": "Показывать окно редактора при быстрых действиях?",
+      "description": "Если вкл, после быстрых действий открывается окно редактора"
+    },
+    "hk_snip": {
+      "title": "Создать скриншот",
+      "description": "Открывает меню «Создать» для быстрого скриншота"
+    },
+    "hk_full": {
+      "title": "Print Screen",
+      "description": "Улучшенная версия кнопки PS: копирует снимок активного монитора даже там, где PS не справляется"
+    },
+    "hk_gif": {
+      "title": "Запись GIF",
+      "description": "Открывает меню «Запись GIF» для быстрой записи экрана"
+    },
+    "shortcuts": {
+      "description": "Быстрые действия внутри программы, не зависящие от ваших биндов"
+    },
+    "tray": {
+      "title": "Фоновая работа в трее",
+      "description": "После закрытия окна программа остаётся в трее, и сочетания клавиш продолжают работать"
+    },
+    "autostart": {
+      "title": "Автозапуск в Windows"
+    },
+    "copy_on_close": {
+      "title": "Защита от случайного закрытия",
+      "description": "При закрытии спрашивает, сохранить ли текущую работу в редакторе изображения"
+    }
+  }
+}

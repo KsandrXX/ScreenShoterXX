@@ -1,0 +1,10 @@
+settings.json
+settings_layout.json.bak
+logs/
+гифки/
+снимки/
+__pycache__/
+*.pyc
+release/
+build/
+dist/
