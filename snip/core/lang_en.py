@@ -115,6 +115,9 @@ EN = {
     "PrintScreen занят — как освободить": "PrintScreen is taken — how to free it",
     "Как освободить PrintScreen": "How to free PrintScreen",
     "Что нового": "What's new",
+    "Исправления": "Fixes",
+    "Окно настроек открывается ровно по высоте самой длинной вкладки: в V1.01 оно было заметно выше нужного.":
+        "The settings window opens at exactly the height of the longest tab: in V1.01 it was noticeably too tall.",
     "Список изменений": "Changelog",
     "Что менялось от версии к версии": "What changed from version to version",
     "Игры на весь экран": "Fullscreen games",

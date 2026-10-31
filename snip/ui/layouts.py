@@ -413,6 +413,7 @@ class SettingsLayout(tk.Frame):
         self.body = C.ScrollArea(self, th, "surface")
         self.navw = None
         self._width = 0
+        self._tall = None               # (ширина, высота самой длинной страницы)
         # Страница строится один раз, когда известна настоящая ширина (первый показ).
         # Если строить сразу, она собирается под ширину 1 px и потом пересобирается
         # на глазах — мерцание и «фантомные» иконки.
@@ -431,6 +432,35 @@ class SettingsLayout(tk.Frame):
         """Высота вида, при которой страница влезает целиком, без прокрутки."""
         self.update_idletasks()
         return self.winfo_height() + self.body.body.winfo_reqheight() - self.body.cv.winfo_height()
+
+    def tallest(self, width):
+        """Высота вида под самую длинную страницу при этой ширине. Раскладку может менять
+        пользователь, поэтому страницы меряются настоящей сборкой, один раз на ширину. Вид ещё
+        скрыт; после замера построена текущая страница, первый показ её не пересобирает.
+        В окне шире замеренного строки только короче, поэтому прошлый замер годится."""
+        if self._tall and self._tall[0] <= width:
+            return self._tall[1]
+        self._width = width
+        narrow = width < self.th.size("settings_narrow")
+        if narrow != self.narrow:
+            self._build_nav(narrow)
+        page, built, self.on_built = self.page, self.on_built, None
+        top = 0
+        for p in self._pages():
+            self.page = p.id
+            self._build_page()
+            for row in self.rows.values():      # в скрытом виде ширина строки случайная, не слушать её
+                if row.control is not None and not row.force_stacked:
+                    row.unbind("<Configure>")
+                    row._arrange(self._row_width() < row._need())
+            self.update_idletasks()
+            top = max(top, self.body.body.winfo_reqheight())
+        self.page = page
+        self._build_page()
+        self.on_built = built
+        nav = self.nav.winfo_reqheight()
+        self._tall = (width, top + nav if narrow else max(top, nav))
+        return self._tall[1]
 
     def _row_width(self):
         """Ширина строки настройки при текущей ширине — чтобы сразу разложить строки верно."""

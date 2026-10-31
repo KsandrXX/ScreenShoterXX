@@ -33,7 +33,7 @@ from .update import Updater
 
 _DEFAULT_REPORT = tk.Tk.report_callback_exception
 APP_NAME = "Ножницы XX"
-APP_VERSION = "1.01"            # версия релиза, публичная нумерация: с ней сверяется обновление (B24)
+APP_VERSION = "1.02"            # версия релиза, публичная нумерация: с ней сверяется обновление (B24)
 APP_ID = "ScreenshoterXX.Snipper"
 SNIP_HINTS = {"free": "Обведите область", "rect": "Выделите область", "window": "Щёлкните по окну",
               "full": "Весь экран"}
@@ -181,6 +181,8 @@ class App:
                                             on_page=lambda p: self.settings.set("settings_page", p),
                                             on_built=self._fit_settings_height, editor=self.layout_editor)
         shell.add_view("settings", self.settings_view)
+        if not self.layout_edit:
+            self.root.after(self.th.timing("settings_measure"), self._measure_settings)
 
         self.set_status(*self._status)
 
@@ -360,12 +362,19 @@ class App:
             mx, my, mw, mh = W.monitor_under_cursor(work=True)
             frame = self.root.winfo_rooty() - y     # системный заголовок окна
             new_w = min(max(w, need_w), mw)
+            if not self.layout_edit:                # сразу по самой длинной странице: при переходах окно не растёт
+                need_h = self.settings_view.tallest(new_w) + h - self.shell.main.winfo_height()
             new_h = min(max(h, need_h), mh - frame)
             new_x = max(mx, x + w - new_w)          # растём влево, но не за край монитора
             new_y = max(my, min(y, my + mh - frame - new_h))   # у нижнего края — подняться
             self.root.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")   # сначала размер, потом содержимое
             self.root.update_idletasks()
             self.show_view("settings", resize=False)    # страница подгонит высоту (on_built)
+
+    def _measure_settings(self):
+        """Замер страниц заранее: на первом входе в настройки он стоил бы заметных 0,4 с."""
+        if self.idle() and self.view != "settings" and self.settings_view.winfo_exists():
+            self.settings_view.tallest(self.th.size("settings_window")[0])
 
     def _fit_settings_height(self):
         """Страница настроек не влезает по высоте — дорастить окно вниз (до края монитора).
