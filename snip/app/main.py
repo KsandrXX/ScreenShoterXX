@@ -14,10 +14,13 @@ from PIL import Image, ImageDraw
 from ..core import i18n
 from ..core.i18n import tr
 from ..core import winapi as W
+from ..core.changes import CHANGES
+from ..core.dxgi import Duplicator
 from ..core.gif import GifCapture, save_gif_async
 from ..core.settings import Settings
 from ..ui import components as C
-from ..ui.layouts import AppShell, HudToolbar, Modal, SettingsLayout, action_tip, ask, window_hooks
+from ..ui.layouts import (AppShell, Dialog, HudToolbar, Modal, SettingsLayout, action_tip, ask, changes_list,
+                          window_hooks)
 from ..ui.registry import Registry
 from ..ui.tokens import ANNOTATION, TECH, Theme
 from . import features
@@ -26,10 +29,11 @@ from .editor import EditorModel, EditorView
 from .layout_store import LayoutEditor, LayoutStore
 from .overlay import Overlay
 from .rechud import RecHud
+from .update import Updater
 
 _DEFAULT_REPORT = tk.Tk.report_callback_exception
 APP_NAME = "Ножницы XX"
-APP_VERSION = "1.00"            # версия релиза (проверка обновлений — B24)
+APP_VERSION = "1.01"            # версия релиза, публичная нумерация: с ней сверяется обновление (B24)
 APP_ID = "ScreenshoterXX.Snipper"
 SNIP_HINTS = {"free": "Обведите область", "rect": "Выделите область", "window": "Щёлкните по окну",
               "full": "Весь экран"}
@@ -48,6 +52,7 @@ class App:
         self.app_dir = app_dir
         self.data_dir = data_dir or app_dir
         self.layout_edit = layout_edit
+        self.updater = Updater(self, APP_VERSION)
         self.settings = Settings(settings_path or os.path.join(self.data_dir, "settings.json"),
                                  media_dir or self.data_dir)
         self.media_root = media_root
@@ -74,6 +79,10 @@ class App:
         self._geom_before_rec = None
         self.rec_hud = None
         self._silent = None
+        self._game = None                   # (x, y, w, h) монитора игры на весь экран: снимок и GIF (B38, B39)
+        self._snip_editor = False           # снимок идёт в редактор (в игре окно показывается только потом)
+        self._auto_job = None               # отложенное автосохранение
+        self._auto_version = None           # версия модели, которая уже в буфере
         self._geom_before_settings = None
         self._gif_saving = None
         self.tray = None
@@ -103,6 +112,7 @@ class App:
         # модальное окно: живое затемнение и следование за окном прямо из его оконной процедуры
         self.frame_watch = W.FrameWatch(self.root)
         W.FrameWatch.on_error = self._log_exception   # ошибки из оконной процедуры — в журнал
+        self.root.bind("<Map>", self._restored, add="+")
         Modal.host = W.OverlayHost(self.frame_watch)
         C.Tooltip.screen_rect = W.widget_rect   # подсказки — по настоящему положению виджета
         self.settings.listeners.append(self._setting_changed)
@@ -217,8 +227,12 @@ class App:
         parts = []
         if s["hk_snip"]:
             parts.append(tr("{} — снимок").format(s["hk_snip"]))
+        if s["hk_quick"]:
+            parts.append(tr("{} — снимок без редактора").format(s["hk_quick"]))
         if s["hk_full"]:
             parts.append(tr("{} — весь экран").format(s["hk_full"]))
+        if s["hk_full_edit"]:
+            parts.append(tr("{} — весь экран с редактором").format(s["hk_full_edit"]))
         if s["hk_gif"]:
             parts.append(tr("{} — запись GIF").format(s["hk_gif"]))
         return "  ·  ".join(parts) + (tr("  (из любой программы)") if parts else "")
@@ -344,10 +358,12 @@ class App:
             if self.layout_edit:                    # ручки ⠿ слева от блоков — строки не переносятся
                 need_w += self.th.size("icon") + 2 * self.th.sp(2)
             mx, my, mw, mh = W.monitor_under_cursor(work=True)
+            frame = self.root.winfo_rooty() - y     # системный заголовок окна
             new_w = min(max(w, need_w), mw)
-            new_h = min(max(h, need_h), mh)
+            new_h = min(max(h, need_h), mh - frame)
             new_x = max(mx, x + w - new_w)          # растём влево, но не за край монитора
-            self.root.geometry(f"{new_w}x{new_h}+{new_x}+{y}")   # сначала размер, потом содержимое
+            new_y = max(my, min(y, my + mh - frame - new_h))   # у нижнего края — подняться
+            self.root.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")   # сначала размер, потом содержимое
             self.root.update_idletasks()
             self.show_view("settings", resize=False)    # страница подгонит высоту (on_built)
 
@@ -399,10 +415,84 @@ class App:
         return not self.busy and self.capture is None
 
     # ================================================================ глобальные клавиши
-    HOTKEY_KEYS = {"hk_snip": "Новый снимок", "hk_full": "Снимок всего экрана", "hk_gif": "Запись GIF"}
+    HOTKEY_KEYS = {"hk_snip": "Снимок с редактором", "hk_quick": "Снимок без редактора",
+                   "hk_full": "Снимок всего экрана", "hk_full_edit": "Весь экран с редактором",
+                   "hk_gif": "Запись GIF"}
+    KEYBOARD_PAGE = "ms-settings:easeofaccess-keyboard"
 
     def apply_global_hotkeys(self, wait=False):
-        return self.hotkeys.update({k: self.settings[k] for k in self.HOTKEY_KEYS}, wait=wait)
+        return self.hotkeys.update({k: self.settings[k] for k in self.HOTKEY_KEYS}, wait=wait,
+                                   force=bool(self.settings["hk_force"]))
+
+    def force_changed(self):
+        self.apply_global_hotkeys(wait=True)
+        self.settings_view.refresh_errors()   # строки сочетаний: «занято» пропало или вернулось
+        if self.settings["hk_force"]:
+            self.root.after_idle(self.ask_admin)
+
+    def ask_admin(self):
+        """Сильный режим включили: спросить про запуск от имени администратора (B44). admin_task — команда, на
+        которую создано задание; папку перенесли — команда другая, спрашиваем снова. Любой ответ, кроме согласия
+        (и окно, закрытое мимо кнопок), выключает режим: при следующем включении вопрос будет снова."""
+        exe, args = W.program_command(self.app_dir)
+        cmd = f"{exe} {args}"
+        if self.settings["admin_task"] == cmd:
+            return
+        answer = ask(self.root, self.th, tr("Запускать от имени администратора?"),
+                     tr("Программа получит полный доступ к компьютеру, зато сильный режим заработает во всех окнах.\n\n"
+                        "Windows спросит разрешение один раз, дальше программа сама будет запускаться "
+                        "от имени администратора, без вопросов. Сейчас она перезапустится."),
+                     ((tr("Нет"), "ghost", None), (tr("Разрешить"), "danger", True)), icon=None, kind="admin_ask",
+                     danger=True)
+        h = None
+        path = os.path.join(self.data_dir, "admin_task.xml")
+        if answer:
+            with open(path, "w", encoding="utf-16") as f:
+                f.write(W.admin_task_xml(exe, args, self.app_dir))
+            h = W.run_elevated("schtasks.exe", W.admin_task_args(path))
+        if h:
+            self._admin_wait(h, cmd, path)
+        else:
+            self._force_refused()
+
+    def _force_refused(self):
+        self.settings.set("hk_force", False)  # Settings.set сам вернёт ползунок влево
+        self.force_changed()
+
+    def _admin_wait(self, h, cmd, path):
+        code = W.process_exit(h)
+        if code is None:
+            self.root.after(self.th.timing("poll"), self._admin_wait, h, cmd, path)
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if code:
+            self.toast(tr("Не удалось создать задание Windows: программа работает как обычно"), "error")
+            self._force_refused()
+            return
+        self.settings.set("admin_task", cmd)
+        if not W.is_admin():
+            self.restart_as_admin()
+
+    def restart_as_admin(self):
+        mark = os.path.join(self.data_dir, W.ADMIN_MARK)
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("restart")
+        if W.admin_task_run():
+            self.exit_app()
+        else:
+            os.remove(mark)
+            self.toast(tr("Не удалось создать задание Windows: программа работает как обычно"), "error")
+
+    def show_force(self):
+        """Ссылка «второй вариант»: раздел, где лежит сильный режим (его могли переложить в конструкторе)."""
+        sv = self.settings_view
+        sv.set_page(self.reg.settings["hk_force"].page)
+        row = sv.rows.get("hk_force")
+        if row is not None and row.control is not None:
+            C.focus_auto(row.control)
 
     def set_global_hotkey(self, key, value):
         """Назначить глобальное сочетание. Если Windows его не приняла — вернуть прежнее
@@ -419,12 +509,50 @@ class App:
             return None
         self.settings.set(key, old)
         self.apply_global_hotkeys(wait=True)
+        return self.hotkey_problem(value)
+
+    def hotkey_problem(self, value):
+        """Почему Windows не приняла сочетание — для строки настроек. У PrintScreen — ссылка (текст, по клику):
+        в Windows 11 его по умолчанию держат «Ножницы» (B34). Вне настроек программа об этом молчит."""
         if value.split("+")[-1] == "Print":
-            return (tr("Windows не дала занять PrintScreen. Отключите «Параметры → Специальные возможности → "
-                    "Клавиатура → Использовать кнопку PRINT SCREEN…» или закройте программу, которая её держит"))
-        return tr("Сочетание занято другой программой — выберите другое")
+            return tr("PrintScreen занят — как освободить"), self.print_help
+        return tr("Сочетание занято другой программой — выберите другое или включите сильный режим"), self.show_force
+
+    def show_changes(self):
+        Dialog(self.root, self.th, tr("Что нового"), buttons=((tr("Закрыть"), "primary", None),), kind="changes",
+               build=lambda body, dlg: changes_list(body, dlg, self.th, CHANGES)).wait()
+
+    def print_help(self):
+        def second(body, dlg):
+            C.Link(body, self.th, tr("Второй вариант — сильный режим: программа заберёт клавишу сама"),
+                   lambda: dlg.close("force"), role="body", wrap=self.th.size("dialog_min_w")).pack(
+                anchor="w", pady=(self.th.sp(4), 0))
+
+        answer = Dialog(self.root, self.th, tr("Как освободить PrintScreen"),
+                        text=tr("В Windows 11 эту клавишу забирают встроенные «Ножницы».\n\n"
+                                "1. Нажмите «Открыть параметры».\n"
+                                "2. В поиске параметров введите Print Screen и откройте найденный пункт.\n"
+                                "3. Не нашлось — посмотрите сами. Новые версии Windows 11: Bluetooth и устройства → "
+                                "Клавиатура. Старые: Специальные возможности → Клавиатура → «Экранная клавиатура, "
+                                "клавиши доступа и экран печати».\n"
+                                "4. Выключите переключатель про клавишу Print Screen: название зависит от версии Windows.\n"
+                                "5. Перезапустите программу. Не заработало — перезайдите в Windows.\n\n"
+                                "Не помогло — её держит другая программа: закройте её или выберите другое сочетание."),
+                        buttons=((tr("Закрыть"), "ghost", None), (tr("Открыть параметры"), "primary", True)),
+                        icon="info", kind="print_help", build=second).wait()
+        if answer == "force":
+            self.show_force()
+        elif answer:
+            W.open_file(self.KEYBOARD_PAGE)
+
+    def _restored(self, e):
+        """Свёрнутое окно развернули: показать, когда Tk его нарисует (`FrameWatch.cloak`)."""
+        if e.widget is self.root and self.frame_watch.cloaked:
+            self.root.after(self.th.timing("restore_settle"), lambda: self.frame_watch.cloak(False))
 
     def _poll_hotkeys(self):
+        if self.frame_watch.cloaked and self.root.state() != "iconic":   # окно не должно остаться скрытым
+            self.root.after(self.th.timing("restore_settle"), lambda: self.frame_watch.cloak(False))
         self._drain_hotkeys()
         # в трее — реже: основной путь и так событие из потока, опрос лишь запасной
         self.root.after(self.th.timing("hotkey_poll_tray" if self.in_tray else "hotkey_poll"), self._poll_hotkeys)
@@ -433,14 +561,22 @@ class App:
         try:
             while True:
                 k = self.hk_queue.get_nowait()
-                if k == "show":                 # значок в трее: двойной клик / повторный запуск
+                if isinstance(k, tuple):        # сильный режим поймал сочетание для поля записи
+                    field = self.root.focus_get()
+                    if isinstance(field, C.HotkeyField):
+                        field.take([name for _, _, name in field.MODS if k[1] & W.MOD[name]], k[2])
+                elif k == "show":               # значок в трее: двойной клик / повторный запуск
                     self.show_window()
                 elif k == "exit":               # значок в трее: «Выход»
                     self.exit_app()
                 elif k == "hk_snip":
-                    self.new_snip(source="hotkey")
+                    self.new_snip(hotkey=True)
+                elif k == "hk_quick":
+                    self.new_snip(quiet=True)
                 elif k == "hk_full":            # монитор под курсором, без оверлея; mode не меняется
-                    self.new_snip(source="hotkey", full=True)
+                    self.new_snip(quiet=True, full=True)
+                elif k == "hk_full_edit":
+                    self.new_snip(hotkey=True, full=True)
                 elif k == "hk_gif":
                     self.rec_stop() if self.capture else self.start_gif(source="hotkey")
         except queue.Empty:
@@ -456,34 +592,52 @@ class App:
         self.rebuild()
 
     # ================================================================ тихий режим (глобальная клавиша)
-    def _begin_silent(self, source):
-        """Настройка hotkey_silent + запуск глобальной клавишей: окно программы остаётся как было
+    def _begin_silent(self, quiet):
+        """quiet — сочетание без редактора (B41) или GIF по клавише (B37): окно программы остаётся как было
         (свёрнутым, за другими окнами…), не поднимается и не забирает фокус. Если окно открыто,
         на время захвата оно только исключается из снимка/записи."""
         self._silent = None
-        if source != "hotkey" or not self.settings["hotkey_silent"]:
+        if not quiet:
             return False
-        self._silent = {"fg": W.foreground(), "state": self.root.state()}
-        if self._silent["state"] == "normal":
+        self._silent = {"fg": W.foreground(), "state": self.root.state(), "game": bool(self._game)}
+        if self._silent["state"] in ("normal", "zoomed"):
             W.set_capture_excluded(self.root, True)
         return True
 
-    def _end_silent(self):
-        """Вернуть всё как было: снять исключение из захвата, отдать фокус прежнему окну."""
+    def _end_silent(self, cancelled=False, focus=True):
+        """Вернуть всё как было: снять исключение из захвата, отдать фокус прежнему окну (focus).
+        state "hidden" — редактор спрятан под оверлеем, исключение уже снято (снимать его со
+        скрытого окна нельзя — «призрак»); отменили снимок — окно возвращается."""
         sil, self._silent = self._silent, None
         if not sil:
             return
-        if sil["state"] == "normal":
+        if sil["state"] in ("normal", "zoomed"):
             W.set_capture_excluded(self.root, False)
-        W.set_foreground(sil["fg"])
+        if not focus:
+            return
+        if sil["state"] == "hidden":
+            if cancelled:
+                self.root.deiconify()
+                self.apply_titlebar()
+            elif sil["fg"] == W.hwnd_of(self.root):
+                return                            # фокус был у окна, которое уходит в трей
+        W.set_foreground(sil["fg"], restore=sil["game"])
 
     # ================================================================ снимок
-    def new_snip(self, source="window", full=False):
+    def new_snip(self, quiet=False, full=False, hotkey=False):
         """Новый снимок. full=True — сразу весь монитор под курсором, без оверлея и меню режима
-        (глобальное сочетание «Снимок всего экрана», B18); настройку mode не меняет."""
+        (глобальное сочетание «Снимок всего экрана», B18); настройку mode не меняет.
+        quiet=True — без редактора, только буфер обмена и папка (B41).
+        hotkey=True (и quiet) — глобальным сочетанием: возможна игра на весь экран (B39). Она
+        сворачивается от любого чужого окна, поэтому своё окно не показывается и не прячется:
+        выбор области на стоп-кадре, потом игра возвращается; редактор — только в конце."""
         if not self.idle():
             return
-        silent = self._begin_silent(source)
+        self._game = W.fullscreen_window(exclude=(W.hwnd_of(self.root),)) if quiet or hotkey else None
+        self._snip_editor = not quiet
+        silent = self._begin_silent(quiet or bool(self._game))
+        if silent and not self._game and self.tray and self.view == "image" and self._silent["state"] in ("normal", "zoomed"):
+            self._hide_after_overlay = True       # открытый редактор уходит в трей: уже под оверлеем
         # в тихом режиме снимок в редактор не попадает, поэтому пометки текущего снимка не трогаем
         if not silent and not self._resolve_unsaved(tr("Сохранить пометки на текущем снимке?")):
             return
@@ -515,6 +669,8 @@ class App:
             # исключённое окно и снять исключение уже со скрытого, DWM показывает его «призрак» —
             # белое окно с заголовком поверх всего (снимок для оверлея к этому моменту уже сделан).
             W.set_capture_excluded(self.root, False)
+            if self._silent:
+                self._silent["state"] = "hidden"
             # Прятать — чуть позже, когда DWM точно применил снятие исключения (иначе гонка →
             # призрак). Не DwmFlush: он блокирует программу до следующего кадра — бывает ~1 с.
             # Оверлей закрывает экран, так что пауза не видна.
@@ -534,6 +690,8 @@ class App:
         vx, vy, vw, vh = W.virtual_screen()
         windows = W.list_windows(exclude=(W.hwnd_of(self.root),))   # своё окно не выбирается
         shot = W.grab(vx, vy, vw, vh)
+        if self._game:
+            self._game_shot(shot, vx, vy)
         mode = self.settings["mode"]
         if gif and mode == "free":
             mode = "rect"
@@ -554,6 +712,7 @@ class App:
 
         self._overlay = Overlay(self.root, self.th, shot, (vx, vy), mode, windows, modes, on_mode,
                                 lambda res: on_done(res, shot, vx, vy), hint)
+        self._overlay.hold = bool(self._game)
         self._overlay.bind("<Map>", lambda e: self.root.after_idle(self._after_overlay_shown), add="+")
 
     def _hud_pos(self, vx, vy):
@@ -562,22 +721,15 @@ class App:
 
     def _do_snip(self, full=False):
         if full or self.settings["mode"] == "full":
-            img = W.grab(*W.monitor_under_cursor())
+            img = self._game and self._game_frame()   # игра на весь экран без оверлея не сворачивается
+            if not img:
+                img = W.grab(*(self._game or W.monitor_under_cursor()))
             self._after_overlay_shown()
             self.busy = False
-            self._deliver_snip(img)
+            self._snip_ready(img)
             return
 
-        def done(res, shot, vx, vy):
-            self.busy = False
-            self._overlay = None
-            if not res:
-                if self._silent:
-                    self._end_silent()
-                elif not self.in_tray:          # отменили снимок из трея — окно остаётся в трее
-                    self.root.deiconify()
-                self.header.refresh()
-                return
+        def cut(res, shot):
             l, t, r, b = res["box"]
             img = shot.crop((l, t, r, b))
             if res["poly"]:
@@ -586,9 +738,48 @@ class App:
                 bg = Image.new("RGB", img.size, ANNOTATION["freeform_bg"])
                 bg.paste(img, mask=mask)
                 img = bg
-            self._deliver_snip(img)
+            return img
+
+        def done(res, shot, vx, vy):
+            ov, self._overlay = self._overlay, None
+
+            def finish():
+                self.busy = False
+                if res:
+                    self._snip_ready(cut(res, shot))
+                    return
+                self._game = None
+                if self._silent:
+                    self._end_silent(cancelled=True)
+                elif not self.in_tray:          # отменили снимок из трея — окно остаётся в трее
+                    self.root.deiconify()
+                self.header.refresh()
+
+            if not self._game:
+                finish()
+            elif res and self._snip_editor:     # дальше редактор: игре незачем возвращаться
+                ov.destroy()
+                finish()
+            else:                               # оверлей закрывается ПОСЛЕ возврата игры: без пустого экрана
+                def back():
+                    ov.destroy()
+                    finish()
+                W.set_foreground(self._silent["fg"], restore=True)
+                self._when_game_back(self._silent["fg"], back)
 
         self._open_overlay(False, done)
+
+    def _snip_ready(self, img):
+        """Снимок готов. В игре окно не показывалось и при снимке с редактором: теперь можно."""
+        if self._silent and self._snip_editor:
+            self._end_silent(focus=False)
+            if self.in_tray:
+                self.show_window()              # вопрос «Сохранить пометки?» — при видимом окне
+            if not self._resolve_unsaved(tr("Сохранить пометки на текущем снимке?")):
+                self._game = None
+                return
+        self._game = None
+        self._deliver_snip(img)
 
     def _deliver_snip(self, img):
         """Всегда — в буфер обмена (и в папку, если включено). Обычно ещё и в редактор; в тихом
@@ -605,10 +796,26 @@ class App:
             return
         self.set_status(tr("Снимок {} × {} px").format(img.width, img.height) + note,
                         "success" if copied else "warning")
+        sil = self._silent                        # из-под игры окно не прячем заранее, только теперь
+        hidden = sil["state"] == "hidden" or (sil["game"] and self.tray and self.view == "image"
+                                              and sil["state"] in ("normal", "zoomed"))
         self._end_silent()
+        if hidden:
+            self.root.after(self.th.timing("dwm_settle"), self._editor_to_tray)
+
+    def _editor_to_tray(self):
+        """Спрятать окно редактора в трей — с паузой после снятия исключения из захвата (иначе
+        DWM оставляет «призрак») и без анимации Windows: без оверлея (весь экран) она видна.
+        Без значка не звать: крестик тогда закрывает программу."""
+        if self.tray and self.idle() and self.view == "image":
+            W.set_transitions(self.root, False)
+            self.close_window()
+            self.root.after(self.th.timing("hide_anim"), lambda: W.set_transitions(self.root, True))
 
     def load_image(self, img, note=""):
+        self._autosave_now()
         self.model.load(img)
+        self._auto_version = self.model.version
         self.show_view("image")
         self.in_tray = False
         self.root.deiconify()
@@ -645,6 +852,35 @@ class App:
     # --- редактор ---
     def _editor_changed(self):
         self.editor_bar.refresh()
+        self._autosave_later()
+
+    def _autosave_later(self):
+        """Правка в редакторе: через паузу готовая картинка — в буфер обмена. Новая правка откладывает
+        сохранение: на каждый мазок картинку не собираем."""
+        if self._auto_job:
+            self.root.after_cancel(self._auto_job)
+            self._auto_job = None
+        if self.settings["snip_autosave"] and self.model.base and self.model.version != self._auto_version:
+            self._auto_job = self.root.after(self.th.timing("autosave"), self._autosave)
+
+    def _autosave(self):
+        """Только сама картинка снимка (`export`): нарисованное за краем в неё не входит (B7)."""
+        self._auto_job = None
+        if self.editor_view.live:             # ещё рисуют: сохранит отпускание кнопки
+            return
+        s, version = self.settings, self.model.version
+        if not s["snip_autosave"] or not self.model.base or version == self._auto_version:
+            return
+        # в буфере уже всё: спрашивать «Сохранить?» при закрытии незачем. Файл снимка в папке не меняется
+        if not s["clipboard_off"] and W.copy_image(self.model.export()):
+            self.model.saved = True
+            self._auto_version = version      # буфер занят — сохранит следующая правка, вопрос останется
+
+    def _autosave_now(self):
+        """Снимок сейчас сменится или закроется: не потерять правку, ждущую паузы."""
+        if self._auto_job:
+            self.root.after_cancel(self._auto_job)
+            self._autosave()
 
     def set_tool(self, tool):
         self.model.tool = tool
@@ -707,17 +943,17 @@ class App:
     def undo(self):
         if self.model.undo():
             self.editor_view.render()
-            self.editor_bar.refresh()
+            self._editor_changed()
 
     def redo(self):
         if self.model.redo():
             self.editor_view.render()
-            self.editor_bar.refresh()
+            self._editor_changed()
 
     def clear_marks(self):
         if self.model.clear():
             self.editor_view.render()
-            self.editor_bar.refresh()
+            self._editor_changed()
 
     def pick_color(self, key, field=None):
         title = tr("Палитра цветов (Перо)") if key == "pen_color" else tr("Палитра цветов (Маркер)")
@@ -789,7 +1025,10 @@ class App:
     def start_gif(self, source="window"):
         if not self.idle():
             return
-        silent = self._begin_silent(source)
+        # игра на весь экран сворачивается, как только другое окно получает фокус: выбор области
+        # идёт на её стоп-кадре, потом игра возвращается, а рамки и панели записи нет (B38)
+        self._game = W.fullscreen_window(exclude=(W.hwnd_of(self.root),)) if source == "hotkey" else None
+        silent = self._begin_silent(source == "hotkey")      # GIF по клавише окно не открывает (B37)
         self.busy = True
         self.prev_view = self.view if self.view in ("empty", "image") else "empty"
         self._geom_before_rec = self.root.geometry()
@@ -798,23 +1037,65 @@ class App:
     def _gif_select(self):
         if self.settings["mode"] == "full":
             self._after_overlay_shown()
-            self._gif_begin(*W.monitor_under_cursor())
+            if self._game:                    # без оверлея игра даже не сворачивается
+                self._gif_begin(*self._game, windows=False)
+            else:
+                self._gif_begin(*W.monitor_under_cursor())
             return
 
+        def cancel():
+            self.busy = False
+            self._game = None
+            if self._silent:
+                self._end_silent()
+            elif not self.in_tray:
+                self.root.deiconify()
+            self.header.refresh()
+
         def done(res, shot, vx, vy):
-            self._overlay = None
-            if not res:
-                self.busy = False
-                if self._silent:
-                    self._end_silent()
-                elif not self.in_tray:
-                    self.root.deiconify()
-                self.header.refresh()
-                return
-            l, t, r, b = res["box"]
-            self.root.after(80, lambda: self._gif_begin(l + vx, t + vy, r - l, b - t))
+            ov, self._overlay = self._overlay, None
+            box = None
+            if res:
+                l, t, r, b = res["box"]
+                box = (l + vx, t + vy, r - l, b - t)
+            if self._game:                    # оверлей закрывается ПОСЛЕ возврата игры: без пустого экрана
+                def back():
+                    ov.destroy()
+                    self._gif_begin(*box, windows=False) if box else cancel()
+                W.set_foreground(self._silent["fg"], restore=True)
+                self._when_game_back(self._silent["fg"], back)
+            elif box:
+                self.root.after(80, lambda: self._gif_begin(*box))
+            else:
+                cancel()
 
         self._open_overlay(True, done)
+
+    def _when_game_back(self, hwnd, then, waited=0):
+        """Игра свернулась на время выбора области: начать запись, когда она снова на весь экран."""
+        th = self.th
+        if W.is_ready(hwnd) or waited >= th.timing("game_return"):
+            self.root.after(th.timing("game_settle"), then)
+            return
+        W.set_foreground(hwnd, restore=True)
+        self.root.after(th.timing("poll"), lambda: self._when_game_back(hwnd, then, waited + th.timing("poll")))
+
+    def _game_frame(self):
+        """Кадр монитора игры: GDI видит её устаревший кадр (B38). None — не вышло."""
+        try:
+            d = Duplicator(*self._game)
+            try:
+                return d.grab()
+            finally:
+                d.close()
+        except Exception:
+            return None
+
+    def _game_shot(self, shot, vx, vy):
+        """Стоп-кадр игры для выбора области. Не вышло — останется кадр GDI."""
+        frame = self._game_frame()
+        if frame:
+            shot.paste(frame, (self._game[0] - vx, self._game[1] - vy))
 
     def _make_border(self, x, y, w, h):
         th = self.th
@@ -832,12 +1113,17 @@ class App:
         C.window_badge(b, th, "rec_border", corner="nw")
         return b
 
-    def _gif_begin(self, x, y, w, h):
+    def _gif_begin(self, x, y, w, h, windows=True):
         """Запись: рамка вокруг области + стеклянная панель сверху экрана.
-        Главное окно спрятано до конца записи; панель и рамка в GIF не попадают."""
+        Главное окно спрятано до конца записи; панель и рамка в GIF не попадают.
+        windows=False — поверх игры: ни одного своего окна (забрали бы фокус)."""
         s = self.settings
         self.capture = c = GifCapture(x, y, w, h, s["fps"], float(s["gif_scale"]) / 100, s["gif_cursor"],
                                       limit=s["gif_limit"])
+        if not windows:
+            self.capture.start()
+            self._rec_tick()
+            return
         self.rec_border = self._make_border(x, y, w, h)
         reserve = self._rec_segments(c, c.max_frames, 0, wide=True)    # ширина под самый длинный текст
         self.rec_hud = RecHud(self.root, self.th, (x, y, w, h), self.reg.list_for("rec"),
@@ -872,7 +1158,7 @@ class App:
             self.rec_stop()
             return
         every = max(1, self.th.timing("blink") // self.th.timing("poll"))
-        if n % every == 0:
+        if n % every == 0 and self.rec_hud:
             self.rec_hud.refresh(self._rec_segments(c, len(c.frames), c.elapsed()), c.paused)
         self.root.after(self.th.timing("poll"), lambda: self._rec_tick(n + 1))
 
@@ -880,11 +1166,13 @@ class App:
         if self.capture:
             c = self.capture
             c.toggle_pause()
-            self.rec_hud.refresh(self._rec_segments(c, len(c.frames), int(c.elapsed())), c.paused)
+            if self.rec_hud:
+                self.rec_hud.refresh(self._rec_segments(c, len(c.frames), int(c.elapsed())), c.paused)
 
     def _end_recording(self):
         cap = self.capture
         self.capture = None
+        self._game = None
         for w in (self.rec_border, self.rec_hud):
             if w:
                 w.destroy()
@@ -898,6 +1186,7 @@ class App:
         if self._geom_before_rec:
             self.root.geometry(self._geom_before_rec)
         self.in_tray = False                  # итог записи — в окне (как и без трея)
+        self._restore_editor()
         self.root.deiconify()
         self.apply_titlebar()
         self.header.refresh()
@@ -1006,13 +1295,8 @@ class App:
     def autostart_command(self):
         """Команда автозапуска: pythonw (без консоли) + snipper.pyw + --tray (сразу в трей); пути в кавычках.
         У exe — сам exe + --tray."""
-        if getattr(sys, "frozen", False):
-            return f'"{sys.executable}" --tray'
-        exe = sys.executable
-        w = os.path.join(os.path.dirname(exe), "pythonw.exe")
-        if os.path.exists(w):
-            exe = w
-        return f'"{exe}" "{os.path.join(self.app_dir, "snipper.pyw")}" --tray'
+        exe, args = W.program_command(self.app_dir)
+        return " ".join(p for p in (f'"{exe}"', args, "--tray") if p)
 
     def sync_autostart(self, explicit=False):
         """Запись автозапуска в реестре — по настройкам. Нужна (трей + автозапуск) — проверить путь
@@ -1037,15 +1321,22 @@ class App:
         работают дальше, пометки не теряются); без значка — выход, как раньше."""
         if self.tray and not self.capture:
             self.in_tray = True
+            W.hand_off_focus()
             self.root.withdraw()              # не destroy: показать снова — двойной клик по значку
+            self.editor_view.release()
         else:
             self.quit()
+
+    def _restore_editor(self):
+        if self.view == "image":
+            self.editor_view.restore()
 
     def show_window(self):
         """Показать окно из трея (двойной клик по значку, повторный запуск ярлыка)."""
         if not self.idle():                   # идёт снимок или запись — окно покажется само
             return
         self.in_tray = False
+        self._restore_editor()
         self.root.deiconify()                 # и спрятанное, и свёрнутое
         self.apply_titlebar()
         self.root.lift()
@@ -1073,11 +1364,13 @@ class App:
         if self.tray:                         # иначе в трее остаётся «призрак» значка
             self.tray.close()
             self.tray = None
+        W.hand_off_focus()
         self.root.destroy()
 
     def _resolve_unsaved(self, question):
         """Что делать с несохранёнными пометками. True — можно продолжать (закрыть / новый снимок).
         Настройка «copy_on_close»: молча скопировать снимок с пометками в буфер обмена."""
+        self._autosave_now()
         if not self.model.has_unsaved_marks():
             return True
         if self.settings["copy_on_close"]:

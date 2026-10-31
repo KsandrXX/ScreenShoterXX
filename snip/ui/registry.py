@@ -56,6 +56,7 @@ class Action:
     hold: Optional[Callable] = None  # удержание кнопки (TIMING.hold): hold(widget) — например, меню режимов
     keys: Optional[str] = None       # группа в окне «Все клавиши»; по умолчанию — группы панели (Group.keys)
     key: Optional[Callable] = None   # своя обработка горячей клавиши: key(hotkey) вместо set/handler
+    sep: bool = False                # линия перед действием внутри группы (цвет отделён от названия инструмента)
     order: int = 0
 
     @property
@@ -78,6 +79,7 @@ class Page:
     title: str
     icon: str = "settings"
     order: int = 0
+    bottom: bool = False             # прижат к низу списка разделов, всегда после остальных
 
 
 @dataclass
@@ -85,7 +87,7 @@ class Setting:
     key: str
     title: str
     page: str
-    kind: str = "toggle"             # toggle | select | slider | path | hotkey | color | info | shortcuts
+    kind: str = "toggle"             # toggle | select | slider | path | hotkey | color | info | shortcuts | button
     description: Optional[str] = None
     default: Any = None              # значение, пока пользователь его не менял
     options: Any = None              # select: [(value, text)] или callable
@@ -109,8 +111,13 @@ class Registry:
         self.groups = {}
         self.pages = {}
         self.settings = {}
+        self.mouse_keys = []
 
     # --- регистрация ---
+    def mouse_key(self, title, keys, group):
+        """Строка окна «Все клавиши» для приёма с мышью: у него нет действия и своей клавиши."""
+        self.mouse_keys.append((title, keys, group))
+
     def group(self, id, surface, order=0, align="left", keys=None):
         self.groups[(surface, id)] = Group(id, surface, order, align, keys)
 
@@ -121,8 +128,8 @@ class Registry:
         self.actions[id] = a
         return a
 
-    def page(self, id, title, icon="settings", order=0):
-        self.pages[id] = Page(id, title, icon, order)
+    def page(self, id, title, icon="settings", order=0, bottom=False):
+        self.pages[id] = Page(id, title, icon, order, bottom)
 
     def setting(self, key, title, page, **kw):
         self.settings[key] = Setting(key, title, page, **kw)
@@ -155,7 +162,7 @@ class Registry:
         return sorted(acts, key=lambda a: (-a.priority, a.order))
 
     def page_list(self):
-        return sorted(self.pages.values(), key=lambda p: p.order)
+        return sorted(self.pages.values(), key=lambda p: (p.bottom, p.order))
 
     def settings_for(self, page):
         items = [s for s in self.settings.values() if s.page == page]
@@ -179,20 +186,35 @@ class Registry:
             if a.hotkey:
                 keys = [human_key(k) for k in (a.hotkey,) + tuple(a.alt_hotkeys)]
                 groups.setdefault(self.key_group(a), []).append((a.title, keys))
-        order = list(self.KEY_GROUPS) + sorted(g for g in groups if g not in self.KEY_GROUPS
+        for title, keys, group in self.mouse_keys:
+            groups.setdefault(group, []).append((title, [keys]))
+        order =list(self.KEY_GROUPS) + sorted(g for g in groups if g not in self.KEY_GROUPS
                                                and g != self.KEY_OTHER) + [self.KEY_OTHER]
         return [(tr(g), groups[g]) for g in order if g in groups]    # группы — по-русски внутри
 
     # --- горячие клавиши ---
     def bind_hotkeys(self, root, active_surfaces):
         """Привязать локальные клавиши действий к окну. active_surfaces() -> множество
-        поверхностей, которые сейчас на экране (клавиша работает только для них)."""
+        поверхностей, которые сейчас на экране (клавиша работает только для них).
+
+        Привязка по букве не срабатывает в русской раскладке: Tk присылает keysym «??». Для этого
+        есть общий <KeyPress> по коду клавиши: Tk вызывает его, только если буквенная привязка
+        не подошла, поэтому дважды действие не сработает."""
+        by_code = {}
         for a in self.actions.values():
             if not a.hotkey:
                 continue
             for hk in (a.hotkey,) + tuple(a.alt_hotkeys):
                 for seq in tk_sequences(hk):
                     root.bind(seq, lambda e, a=a, hk=hk: _fire(e, a, active_surfaces, hk), add="+")
+                if key_code(hk):
+                    by_code[key_code(hk)] = (a, hk)
+
+        def fire_by_code(e):
+            a, hk = by_code.get(pressed_code(e), (None, None))
+            return _fire(e, a, active_surfaces, hk) if a else None
+        root.bind("<KeyPress>", fire_by_code, add="+")
+        root.bind_all("<KeyPress>", _text_by_code, add="+")   # поля есть и в других окнах
 
 
 TEXT_EDIT_KEYS = {"Ctrl+C", "Ctrl+X", "Ctrl+V", "Ctrl+Z", "Ctrl+Y", "Ctrl+Shift+Z", "Ctrl+A"}
@@ -219,6 +241,37 @@ def _fire(event, action, active_surfaces, hotkey=None):
 
 _TK_MODS = {"Ctrl": "Control", "Alt": "Alt", "Shift": "Shift"}
 _TK_KEYS = {",": "comma", ".": "period", "/": "slash", ";": "semicolon", "-": "minus", "=": "equal"}
+_VK_KEYS = {",": 0xBC, ".": 0xBE, "/": 0xBF, ";": 0xBA, "-": 0xBD, "=": 0xBB}
+_STATE_MODS = {"Ctrl": 0x4, "Shift": 0x1, "Alt": 0x20000}
+
+
+def key_code(hotkey):
+    """"Ctrl+Z" -> (модификаторы, код клавиши Windows) или None, если клавиша не буква, цифра или знак."""
+    parts = hotkey.split("+")
+    if len(parts[-1]) != 1:
+        return None
+    return frozenset(parts[:-1]), _VK_KEYS.get(parts[-1]) or ord(parts[-1].upper())
+
+
+def pressed_code(event):
+    """То же для нажатия: код клавиши не зависит от раскладки (event.keycode = VK в Windows)."""
+    return frozenset(m for m, bit in _STATE_MODS.items() if event.state & bit), event.keycode
+
+
+_TEXT_EVENTS = {key_code(k): ev for k, ev in (
+    ("Ctrl+C", "<<Copy>>"), ("Ctrl+X", "<<Cut>>"), ("Ctrl+V", "<<Paste>>"), ("Ctrl+A", "<<SelectAll>>"),
+    ("Ctrl+Z", "<<Undo>>"), ("Ctrl+Y", "<<Redo>>"), ("Ctrl+Shift+Z", "<<Redo>>"))}
+
+
+def _text_by_code(event):
+    """Правка в поле ввода не в латинской раскладке: привязки самого поля тоже идут по букве."""
+    from .components import is_text_input
+    latin = len(event.keysym) == 1 and event.keysym.isascii()
+    action = _TEXT_EVENTS.get(pressed_code(event))
+    if action and not latin and is_text_input(event.widget):
+        event.widget.event_generate(action)
+        return "break"
+    return None
 
 
 _HUMAN_KEYS = {"space": "Пробел", "Return": "Enter", "Escape": "Esc"}

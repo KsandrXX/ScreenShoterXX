@@ -43,7 +43,7 @@ class LayoutStore:
     def remember_defaults(self, reg):
         if self.defaults is None:
             self.defaults = {
-                "pages": {p.id: (p.title, p.icon, p.order) for p in reg.pages.values()},
+                "pages": {p.id: (p.title, p.icon, p.order, p.bottom) for p in reg.pages.values()},
                 "settings": {s.key: (s.page, s.section, s.order, s.title, s.description)
                              for s in reg.settings.values()}}
 
@@ -104,9 +104,9 @@ class LayoutStore:
         for pid in list(reg.pages):
             if pid not in self.defaults["pages"]:
                 del reg.pages[pid]                  # раздел, созданный в конструкторе
-        for pid, (title, icon, order) in self.defaults["pages"].items():
+        for pid, (title, icon, order, bottom) in self.defaults["pages"].items():
             if pid not in reg.pages:
-                reg.page(pid, title, icon=icon, order=order)   # раздел удалили в конструкторе
+                reg.page(pid, title, icon=icon, order=order, bottom=bottom)   # раздел удалили в конструкторе
             pg = reg.pages[pid]
             pg.title, pg.icon, pg.order = title, icon, order
         for key, v in self.defaults["settings"].items():
@@ -253,7 +253,9 @@ class LayoutEditor:
         while self._page(f"user_{n}") or f"user_{n}" in self.reg.pages:
             n += 1
         pid = f"user_{n}"
-        self.data["pages"].append({"id": pid, "title": title, "icon": "settings", "items": []})
+        ps = self.data["pages"]
+        at = next((i for i, p in enumerate(ps) if p["id"] in self.reg.pages and self.reg.pages[p["id"]].bottom), len(ps))
+        ps.insert(at, {"id": pid, "title": title, "icon": "settings", "items": []})
         self._commit()
         return pid
 
@@ -266,9 +268,21 @@ class LayoutEditor:
         ps = self.data["pages"]
         i = ps.index(self._page(pid))
         j = i + d
-        if not 0 <= j < len(ps):
+        if not 0 <= j < len(ps) or any(self.reg.pages[ps[k]["id"]].bottom for k in (i, j)):
             return False
         ps[i], ps[j] = ps[j], ps[i]
+        self._commit()
+        return True
+
+    def place_page(self, pid, j):
+        """Раздел pid — перед разделом с номером j (номера — до переноса, как блоки в move)."""
+        ps = self.data["pages"]
+        p = self._page(pid)
+        i = ps.index(p)
+        if j in (i, i + 1):
+            return False                      # на то же место
+        ps.pop(i)
+        ps.insert(j - 1 if j > i else j, p)
         self._commit()
         return True
 

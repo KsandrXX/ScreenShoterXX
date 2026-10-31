@@ -14,6 +14,7 @@ from ..ui import components as C
 from ..ui import paint
 from ..core.winapi import grab, virtual_screen
 from ..ui.layouts import Dialog, window_hooks
+from ..ui.registry import key_code, pressed_code
 from ..ui.tokens import SIZE
 from .eyedropper import Eyedropper
 
@@ -112,7 +113,8 @@ class ColorPicker:
         C.Button(acts, th, tr("Добавить в образцы"), icon="plus", command=self.add_swatch).pack(anchor="w")
         C.Button(acts, th, tr("Пипетка"), icon="eyedropper", command=self.eyedrop,
                  tooltip=(tr("Пипетка"), tr("Цвет с экрана или со снимка")), hotkey="I").pack(anchor="w")
-        dlg.bind("<KeyPress-i>", lambda e: None if C.is_text_input(e.widget) else self.eyedrop())
+        dlg.bind("<KeyPress>", lambda e: self.eyedrop() if pressed_code(e) == key_code("I")
+                 and not C.is_text_input(e.widget) else None, add="+")
 
         grid = tk.Frame(right, bg=bg)
         grid.pack(anchor="w", pady=(th.sp(3), 0))

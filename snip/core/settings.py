@@ -24,6 +24,7 @@ class Settings:
         "gif_temp_dir": "",       # пусто = системная Temp/ScreenshoterXX-GIF (тесты задают свою)
         # снимок всегда кладётся в буфер обмена; в папку — по snip_save (как GIF)
         "snip_save": False,
+        "snip_autosave": True,    # правки снимка сразу уходят в буфер обмена и в его файл
         "snip_dir": "",           # пусто = папка «снимки» рядом с программой
         "snip_counter": 0,
         "clipboard_off": False,   # СКРЫТАЯ, только для тестов: снимок не трогает буфер обмена пользователя
@@ -32,7 +33,6 @@ class Settings:
         "copy_on_close": True,
         # снимок/GIF по глобальной клавише — не показывать окно программы (в окне — наоборот:
         # «Показывать окно редактора после быстрых действий»)
-        "hotkey_silent": False,
         "last_dir": os.path.join(os.path.expanduser("~"), "Pictures"),
         "pen_color": ANNOTATION["pen"],
         "marker_color": ANNOTATION["marker"],
@@ -54,11 +54,15 @@ class Settings:
         # PrintScreen на «Весь экран» ставится только при первом запуске (FIRST_RUN).
         # "" в settings.json — «очищено пользователем» и так и остаётся (не значение по умолчанию)
         "hk_snip": "",
+        "hk_quick": "",
         "hk_gif": "",
         "hk_full": "",
+        "hk_full_edit": "",
         # работа в фоне (B19): закрытие окна прячет его в трей; автозапуск — только при значке в трее
         "tray": False,
         "autostart": False,
+        "hk_force": False,
+        "admin_task": "",              # команда задания «от имени администратора»; "" — задания нет
         "settings_page": "capture",
         # свои быстрые значения окошек («плашки», меняются двойным кликом прямо в окошке):
         # {"gif_limit": [...], "size": [...], "opacity": [...]}; нет ключа — значения по умолчанию
@@ -71,7 +75,6 @@ class Settings:
     FIRST_RUN = {
         "tray": True,
         "hk_full": "Print",
-        "hotkey_silent": True,    # после клавиши окно редактора не показывается
     }
 
     @classmethod
@@ -104,6 +107,8 @@ class Settings:
                         self.data[k] = loaded["tool_size"]
                 elif "pen_width" in loaded:    # ещё раньше: толщина пера
                     self.data["pen_size"] = loaded["pen_width"]
+            if self.data.pop("hotkey_silent", False):   # было одно сочетание и настройка «без окна» (B41)
+                self.data["hk_quick"], self.data["hk_snip"] = self.data["hk_snip"], ""
         except Exception:
             pass
 

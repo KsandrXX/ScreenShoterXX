@@ -20,6 +20,11 @@ A clean interface, a built-in image editor with endless drawing, and a lot of ne
 Windows SmartScreen doesn't know the app because it isn't signed with a paid certificate.
 Tell it to get lost: **More info → Run anyway**.
 
+### Antivirus says it's a virus?
+
+That's a false positive: the app isn't signed and is packed into one file, and some antiviruses, Kaspersky among them, flag such files. All the source code is in this repository.
+Download it only from this page. If the antivirus removed the file, [add it to exclusions](https://support.kaspersky.com/help/kaspersky/win21.5/en-us/227390.htm) first, then [restore it from quarantine](https://support.kaspersky.com/us/kaspersky-for-windows/70904). Menu names depend on the antivirus version.
+
 ## Features
 
 - **Snipping Tool, but better.** Free-form, rectangle, window or full screen. Every screenshot goes
@@ -66,6 +71,11 @@ Needs Python 3.8+ and Pillow: `pip install -r requirements.txt`.
 
 Фильтр SmartScreen не знает программу, потому что она не подписана платным сертификатом.
 Пошлите его: **Подробнее → Выполнить в любом случае**.
+
+### Антивирус считает программу вирусом?
+
+Это ложное срабатывание: программа не подписана и собрана в один файл, а некоторые антивирусы, в том числе Kaspersky, такие файлы не любят. Весь исходный код лежит здесь.
+Скачивайте только с этой страницы. Если антивирус удалил файл, сначала [добавьте его в исключения](https://support.kaspersky.com/help/kaspersky/win21.5/en-us/227390.htm), потом [восстановите из карантина](https://support.kaspersky.com/us/kaspersky-for-windows/70904). Названия пунктов зависят от версии антивируса.
 
 ## Возможности
 

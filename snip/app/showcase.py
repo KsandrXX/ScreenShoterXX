@@ -198,7 +198,7 @@ def build_column(parent, th, scale_note):
     hk.pack(side="left")
     C.ColorField(row, th, ANNOTATION["pen"], show_hex=True).pack(side="left")
     C.ColorField(row, th, ANNOTATION["marker"], small=True, force={"focus"}).pack(side="left")
-    C.PathField(sec, th, "C:\\Games\\screenshoterXX\\гифки", lambda: None, lambda: None, lambda: None,
+    C.PathField(sec, th, "D:\\Изображения\\Гифки", lambda: None, lambda: None, lambda: None,
                 "«гифки»").pack(anchor="w", pady=th.sp(1))
 
     sec = section(col, th, "Вкладки и список")
@@ -209,6 +209,7 @@ def build_column(parent, th, scale_note):
     lv.rows[0].force = {"hover"}
     lv.rows[0].paint()
     lv.pack(anchor="w", pady=th.sp(2))
+    C.ListView(sec, th, [(1, "Строка с ручкой", "settings", None)], width=th.px(240), trail="grip").pack(anchor="w")
 
     sec = section(col, th, "Панель инструментов (HUD) с переполнением")
     reg = Registry()
@@ -252,6 +253,10 @@ def build_column(parent, th, scale_note):
                  build=lambda p: C.Toggle(p, th, True)).pack(fill="x")
     C.SettingRow(sec, th, "С ошибкой", None, error="Сочетание занято другой программой",
                  build=lambda p: C.HotkeyField(p, th, "Ctrl+Alt+S", error=True)).pack(fill="x")
+    C.SettingRow(sec, th, "С ссылкой", None, error=("Занято — как освободить", lambda: None),
+                 build=lambda p: C.HotkeyField(p, th, "Print", error=True)).pack(fill="x")
+    C.SettingRow(sec, th, "Опасная настройка", "Красный текст и рамка", danger=True,
+                 build=lambda p: C.Toggle(p, th, False, danger=True)).pack(fill="x")
     C.EmptyState(sec, th, "image", "Снимка пока нет", "Пустое состояние с действиями",
                  [lambda p: C.Button(p, th, "Создать", icon="snip", variant="primary", size="lg")]).pack(pady=th.sp(2))
 

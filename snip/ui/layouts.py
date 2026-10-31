@@ -156,6 +156,7 @@ class HudToolbar(tk.Frame):
         self.items = []          # (action, widget, group, align)
         self.widgets = {}
         self.dividers = []
+        self.sep_lines = []      # (линия, действие перед ней)
         if lead:
             self.lead = lead(self)
             self.lead.pack(side="left", padx=(0, th.sp(3)))
@@ -164,15 +165,17 @@ class HudToolbar(tk.Frame):
         self.more = C.IconButton(self, th, "more", tr("Ещё"), size=size, command=self._open_more)
         self._hidden = []
         for g, acts in groups:
-            for a in acts:
-                w = self._make(a)
+            for a, nxt in zip(acts, list(acts[1:]) + [None]):
+                # название инструмента стоит у линии: до неё pair_gap вместо обычного поля кнопки
+                trim = th.sp(3) + th.size("focus") + 1 - th.size("pair_gap") if nxt and nxt.sep else 0
+                w = self._make(a, trim)
                 self.items.append((a, w, g))
                 self.widgets[a.id] = w
         self.bind("<Configure>", lambda e: self._relayout())
         self._relayout()
 
     # --- фабрика: вид действия -> компонент ---
-    def _make(self, a):
+    def _make(self, a, trim=0):
         th = self.th
         tip = action_tip(a)
         enabled = a.enabled()
@@ -195,7 +198,7 @@ class HudToolbar(tk.Frame):
             w = C.ColorField(self, th, a.get(), small=True, tooltip=tip, hotkey=a.hotkey,
                              on_pick=lambda f, a=a: a.handler(f), disabled=not enabled)
         elif a.kind == "tool":
-            w = C.Button(self, th, label, icon=icon_name, variant="ghost", size=self.size,
+            w = C.Button(self, th, label, icon=icon_name, variant="ghost", size=self.size, trim=trim,
                          selected=a.get() == a.id, tooltip=tip, hotkey=a.hotkey,
                          command=lambda a=a: (a.set(a.id), self.refresh()), disabled=not enabled,
                          on_hold=a.hold)
@@ -239,6 +242,13 @@ class HudToolbar(tk.Frame):
                     w.relabel(text, ic)
             w.disabled = not a.enabled()
             w.paint()
+        self._paint_sep_lines()
+
+    def _paint_sep_lines(self):
+        """Линия у выбранного инструмента не видна; место остаётся, панель не прыгает."""
+        for d, a in self.sep_lines:
+            on = a.kind == "tool" and a.get() == a.id
+            d.configure(bg=self.cget("bg") if on else self.th.c("border-strong"))
 
     # --- раскладка с переполнением ---
     def _plan(self, avail=None):
@@ -266,8 +276,12 @@ class HudToolbar(tk.Frame):
         th = self.th
         w = sum(wd.W for a, wd, g in self.items if g.align == "right")
         w += (self.lead.winfo_reqwidth() + th.sp(3)) if self.lead else 0
-        groups = {g.id for _, _, g in visible}
-        w += sum(wd.W for _, wd, _ in visible) + max(0, len(groups) - 1) * (2 * th.sp(1) + th.size("border"))
+        w += sum(wd.W for _, wd, _ in visible)
+        for p, x in zip(visible, visible[1:]):
+            if p[2].id != x[2].id:
+                w += 2 * th.sp(1) + th.size("border")
+            elif x[0].sep:
+                w += th.size("border") + th.size("pair_gap") - (th.size("focus") + 1)
         w += self.more.W if hidden else 0
         return w + 2 * int(self.cget("padx"))
 
@@ -289,8 +303,9 @@ class HudToolbar(tk.Frame):
         for d in self.dividers:
             d.destroy()
         self.dividers = []
+        self.sep_lines = []
         self.more.pack_forget()
-        last_group = None
+        last_group = prev = None
         for a, w, g in self.items:
             if a.id in hidden:
                 continue
@@ -299,9 +314,15 @@ class HudToolbar(tk.Frame):
                 d = C.Divider(self, th, vertical=True)
                 d.pack(side="left", fill="y", padx=th.sp(1), pady=th.sp(1))
                 self.dividers.append(d)
+            elif side == "left" and a.sep:   # линия перед образцом цвета: он сам отступает на кольцо
+                d = C.Divider(self, th, vertical=True, length=th.size("swatch"), color="border-strong")
+                d.pack(side="left", padx=(0, th.size("pair_gap") - th.size("focus") - 1))
+                self.dividers.append(d)
+                self.sep_lines.append((d, prev))
             if side == "left":
-                last_group = g.id
+                last_group, prev = g.id, a
             w.pack(side=side)
+        self._paint_sep_lines()
         self._hidden = [a for a, _, _ in self.items if a.id in hidden]
         if self._hidden:
             self.more.pack(side="left")
@@ -373,7 +394,8 @@ class HudToolbar(tk.Frame):
 class SettingsLayout(tk.Frame):
     """Категории слева, строки справа. store: объект с get(key) / set(key, value).
     editor — конструктор настроек (app.layout_store.LayoutEditor, B23): у каждого блока ручка ⠿
-    (перетащить внутри раздела или на раздел слева), тексты правятся щелчком; None — обычный вид."""
+    (перетащить внутри раздела или на раздел слева), тексты правятся щелчком; разделы слева тоже
+    перетаскиваются, двойной щелчок — переименовать; None — обычный вид."""
 
     def __init__(self, parent, th, registry, store, page=None, on_page=None, header=None, on_built=None,
                  editor=None):
@@ -431,8 +453,8 @@ class SettingsLayout(tk.Frame):
             self.page = pages[0].id if pages else None
         if narrow:
             self.navw = C.Tabs(self.nav, th, [(p.id, p.title) for p in pages], self.page,
-                               on_change=self.set_page)
-            self.navw.pack(side="left", padx=th.sp(3), pady=(th.sp(2), 0))
+                               on_change=self.set_page, end={p.id: p.icon for p in pages if p.bottom})
+            self.navw.pack(side="left", fill="x", expand=True, padx=th.sp(3), pady=(th.sp(2), 0))
             if self.editor:
                 C.IconButton(self.nav, th, "plus", tr("Новый раздел"), command=self._add_page).pack(
                     side="left", pady=(th.sp(2), 0))
@@ -443,9 +465,12 @@ class SettingsLayout(tk.Frame):
                 anchor="w", padx=th.sp(4), pady=(th.sp(4), th.sp(2)))
             self.navw = C.ListView(self.nav, th, [(p.id, p.title, p.icon, None) for p in pages],
                                    value=self.page, width=th.size("settings_nav_w"),
-                                   on_select=self.set_page)
-            self.navw.pack(anchor="n", padx=th.sp(2))
+                                   on_select=self.set_page, trail="grip" if self.editor else None,
+                                   bottom=[p.id for p in pages if p.bottom])
+            self.navw.pack(anchor="n", fill="y", expand=True, padx=th.sp(2), pady=(0, th.sp(2)))
             if self.editor:
+                for i, (row, p) in enumerate(zip(self.navw.rows, pages)):
+                    self._nav_block(row, i, not p.bottom)
                 C.Button(self.nav, th, tr("Новый раздел"), icon="plus", variant="ghost",
                          command=self._add_page).pack(anchor="w", padx=th.sp(2), pady=(th.sp(2), 0))
             self.nav.pack(side="left", fill="y")
@@ -493,7 +518,7 @@ class SettingsLayout(tk.Frame):
         self.rows = {}
         for i, s in enumerate(self.reg.settings_for(self.page)):
             # разделитель только МЕЖДУ строками: под последней строкой уже идёт линия строки статуса
-            if i:
+            if i and not s.extra.get("danger"):      # у опасной строки своя рамка
                 C.Divider(wrap, th).pack(fill="x")
             if s.section and s.section != section:
                 section = s.section
@@ -503,8 +528,8 @@ class SettingsLayout(tk.Frame):
             row = C.SettingRow(wrap, th, s.title, s.description(self.store) if callable(s.description)
                                else s.description, build=lambda parent, s=s: self.control(parent, s),
                                error=err() if callable(err) else err, stacked=bool(self.narrow),
-                               avail=self._row_width())
-            row.pack(fill="x")
+                               avail=self._row_width(), danger=bool(s.extra.get("danger")))
+            row.pack(fill="x", pady=th.sp(3) if s.extra.get("danger") else 0)
             self.rows[s.key] = row
         self.body.cv.yview_moveto(0)
         if self.on_built:
@@ -537,6 +562,13 @@ class SettingsLayout(tk.Frame):
             if callable(s.description) and getattr(row, "desc", None) is not None:
                 row.desc.configure(text=s.description(self.store))
 
+    def refresh_errors(self):
+        """Ошибки-функции строк (сочетание занято) — на месте, без пересборки страницы."""
+        for key, row in getattr(self, "rows", {}).items():
+            err = self.reg.settings[key].extra.get("error") if key in self.reg.settings else None
+            if callable(err) and row.winfo_exists():
+                row.set_error(err())
+
     # ------------------------------------------------------------ конструктор настроек (B23)
     def _rebuild(self):
         """После действия конструктора: разделы слева и страница — заново, прокрутка та же.
@@ -556,7 +588,8 @@ class SettingsLayout(tk.Frame):
         th, ed = self.th, self.editor
         bg = th.c("surface")
         C.Text(wrap, th, tr("Конструктор настроек: тащите блок за ⠿ — выше, ниже или на раздел слева. "
-                         "Щёлкните по тексту, чтобы изменить. Всё сохраняется сразу."),
+                         "Щёлкните по тексту, чтобы изменить. Разделы слева тоже можно перетаскивать, "
+                         "двойной щелчок — переименовать. Всё сохраняется сразу."),
                "caption", "secondary", wrap=self._row_width()).pack(anchor="w", pady=(0, th.sp(2)))
         tools = tk.Frame(wrap, bg=bg)
         tools.pack(fill="x", pady=(0, th.sp(3)))
@@ -571,7 +604,7 @@ class SettingsLayout(tk.Frame):
         self._editable(title, p.title, lambda v: (ed.rename_page(self.page, v), self._rebuild()))
         empty = not ed.has_settings(self.page)
         for ic, tip, d in (("chevron_down", tr("Раздел ниже"), 1), ("chevron_up", tr("Раздел выше"), -1)):
-            C.IconButton(head, th, ic, tip,
+            C.IconButton(head, th, ic, tip, disabled=p.bottom,
                          command=lambda d=d: ed.move_page(self.page, d) and self._rebuild()).pack(side="right")
         C.IconButton(head, th, "trash", tr("Удалить раздел") if empty else tr("Удалить можно только пустой раздел"),
                      disabled=not empty, command=self._remove_page).pack(side="right", padx=(0, th.sp(2)))
@@ -632,9 +665,10 @@ class SettingsLayout(tk.Frame):
         label.bind("<Leave>", lambda e: label.configure(fg=fg))
         label.bind("<Button-1>", lambda e: self._edit_text(label, value, on_set))
 
-    def _edit_text(self, label, value, on_set):
+    def _edit_text(self, label, value, on_set, over=None):
+        """Поле вместо текста label; over=(виджет, отступ слева) — поверх виджета: у строки
+        раздела слева текст нарисован на холсте, вынуть его из укладки нельзя."""
         th = self.th
-        info = label.pack_info()
         done = {"v": False}
 
         def commit(text):
@@ -652,13 +686,19 @@ class SettingsLayout(tk.Frame):
             done["v"] = True
             self.after_idle(self._rebuild)
             return "break"
-        w = max(label.winfo_width(), th.size("field_w"))
-        f = C.TextField(label.master, th, value or "", width=min(w, self._row_width() - th.size("icon")),
-                        on_commit=commit)
+        if over:
+            w, x = over
+            f = C.TextField(w.master, th, value or "", width=w.winfo_width() - x - 2 * w.ring, on_commit=commit)
+            f.place(in_=w, x=x, rely=0.5, anchor="w")
+        else:
+            info = label.pack_info()
+            w = max(label.winfo_width(), th.size("field_w"))
+            f = C.TextField(label.master, th, value or "", width=min(w, self._row_width() - th.size("icon")),
+                            on_commit=commit)
+            opts = {k: info[k] for k in ("side", "anchor", "fill", "expand", "padx", "pady") if k in info}
+            f.pack(before=label, **opts)
+            label.pack_forget()
         f.entry.bind("<Escape>", cancel)
-        opts = {k: info[k] for k in ("side", "anchor", "fill", "expand", "padx", "pady") if k in info}
-        f.pack(before=label, **opts)
-        label.pack_forget()
         f.entry.focus_set()
         f.entry.select_range(0, "end")
 
@@ -673,6 +713,40 @@ class SettingsLayout(tk.Frame):
         g.bind("<ButtonRelease-1>", lambda e: self._drag_end())
         return g
 
+    def _nav_block(self, row, i, movable=True):
+        """Раздел слева как блок: щелчок — открыть, потянуть — перенести, двойной — переименовать.
+        Ручки нет: строка сама принимает щелчок, перенос начинается, когда мышь сдвинулась.
+        movable=False — раздел, прижатый к низу: только щелчок и имя."""
+        th = self.th
+        if not movable:
+            C.Tooltip(row, th, tr("Двойной щелчок — переименовать"))
+            row.bind("<Double-Button-1>", lambda e: self._nav_rename(row), add="+")
+            return
+        C.Tooltip(row, th, tr("Тащите, чтобы поменять порядок. Двойной щелчок — переименовать"))
+        at = {}
+
+        def moved(e):
+            if self._drag:
+                self._drag_move()
+            elif at and max(abs(e.x - at["x"]), abs(e.y - at["y"])) >= th.size("drag_start"):
+                row.pressed = False               # уже не щелчок: при отпускании раздел не открывать
+                row.paint()
+                self._nav_drag_start(i)
+                self._drag_move()
+
+        def released(e):
+            at.clear()
+            self._drag_end()
+        row.bind("<ButtonPress-1>", lambda e: at.update(x=e.x, y=e.y), add="+")
+        row.bind("<B1-Motion>", moved, add="+")
+        row.bind("<ButtonRelease-1>", released, add="+")
+        row.bind("<Double-Button-1>", lambda e: self._nav_rename(row), add="+")
+
+    def _nav_rename(self, row):
+        th, pid = self.th, row.value
+        self._edit_text(row, row.text, lambda v: (self.editor.rename_page(pid, v), self._rebuild()),
+                        over=(row, th.sp(3) + th.size("icon_sm")))      # текст поля — там же, где текст строки
+
     # --- перетаскивание: что откуда и куда — видно всё время ---
     # «Отсюда» — блок обведён акцентом; у курсора — карточка с названием блока и итогом
     # («→ в раздел …», «останется на месте»); «сюда» — блоки плавно раздвигаются, в щели —
@@ -684,14 +758,26 @@ class SettingsLayout(tk.Frame):
         blk = self._blocks[i]
         kind, val = self.editor.items(self.page)[i]
         name = val.title if kind == "setting" else (val or tr("Без группы"))
-        self._drag = {
-            "i": i, "name": name, "target": None, "row": None,
+        self._drag = self._drag_state(i, name, blk, self._blocks, self._wrap, self._wrap.winfo_width() - 2 * th.sp(6))
+        self._drag["h"] = min(self._drag["h"], th.size("drag_gap_max"))
+
+    def _nav_drag_start(self, i):
+        self.update_idletasks()
+        row = self.navw.rows[i]
+        rows = [r for r in self.navw.rows if not self.reg.pages[r.value].bottom]
+        self._drag = self._drag_state(i, row.text, row, rows, self.navw, self.navw.winfo_width())
+        self._drag["nav"] = True
+
+    def _drag_state(self, i, name, blk, blocks, host, gap_w):
+        return {
+            "i": i, "name": name, "target": None, "row": None, "nav": False,
+            "blocks": blocks, "host": host, "gap_w": gap_w,
             # середины блоков в начале: место считается по ним (+ высота щели), иначе щель,
             # сдвигая блоки, сама меняла бы место и дёргалась туда-сюда
-            "mids": [bl.winfo_y() + bl.winfo_height() // 2 for bl in self._blocks],
-            "h": min(blk.winfo_height(), th.size("drag_gap_max")),
+            "mids": [bl.winfo_y() + bl.winfo_height() // 2 for bl in blocks],
+            "h": blk.winfo_height(),
             "gap": None, "gap_at": None, "gap_h": 0, "job": None,
-            "outline": self._outline(blk, th.c("accent")), "ghost": self._ghost(name)}
+            "outline": self._outline(blk, self.th.c("accent")), "ghost": self._ghost(name)}
 
     def _outline(self, w, color, t=None):
         """Рамка вокруг виджета — четыре полоски поверх него (у Tk нет прозрачной заливки)."""
@@ -723,6 +809,8 @@ class SettingsLayout(tk.Frame):
         """Куда упадёт блок: ("page", раздел, строка слева) — над разделом слева; ("at", место, None) —
         на странице (место — номер блока, перед которым встанет)."""
         d = self._drag
+        if d["nav"]:
+            return ("at", self._drag_place(y), None)
         w = self.winfo_containing(x, y)
         if w is not None and C.within(w, d["ghost"]):
             w = None
@@ -735,12 +823,17 @@ class SettingsLayout(tk.Frame):
             cv.yview_scroll(-1, "units")          # у края — прокрутить
         elif y > cv.winfo_rooty() + cv.winfo_height() - edge:
             cv.yview_scroll(1, "units")
-        yy = y - self._wrap.winfo_rooty()
+        return ("at", self._drag_place(y), None)
+
+    def _drag_place(self, y):
+        """Перед каким блоком встанет то, что тащим."""
+        d = self._drag
+        yy = y - d["host"].winfo_rooty()
         g, gh = d["gap_at"], d["gap_h"]
         for k, m in enumerate(d["mids"]):
             if yy < m + (gh if g is not None and k >= g else 0):
-                return ("at", k, None)
-        return ("at", len(d["mids"]), None)
+                return k
+        return len(d["mids"])
 
     def _drag_move(self, x=None, y=None):
         d = self._drag
@@ -771,7 +864,10 @@ class SettingsLayout(tk.Frame):
         g = d["ghost"]
         g.note.configure(text=note)
         off = self.th.size("drag_ghost_off")
-        g.place(x=x - self.winfo_rootx() + off, y=y - self.winfo_rooty() + off)
+        gx = x - self.winfo_rootx() + off
+        if d["nav"]:             # список узкий: у курсора карточка закрыла бы щель «Встанет сюда»
+            gx = max(gx, self.navw.winfo_rootx() + self.navw.winfo_width() - self.winfo_rootx() + off)
+        g.place(x=gx, y=y - self.winfo_rooty() + off)
         g.tk.call("raise", g._w)
         d["target"] = t
 
@@ -786,11 +882,11 @@ class SettingsLayout(tk.Frame):
         d["gap"], d["gap_at"], d["gap_h"] = None, j, 0
         if j is None:
             return
-        gap = tk.Canvas(self._wrap, bg=th.c("surface"), height=1, highlightthickness=0, bd=0)
-        if j < len(self._blocks):
-            gap.pack(fill="x", before=self._blocks[j])
+        gap = tk.Canvas(d["host"], bg=th.c("surface"), width=1, height=1, highlightthickness=0, bd=0)
+        if j < len(d["blocks"]):
+            gap.pack(fill="x", before=d["blocks"][j])
         else:
-            gap.pack(fill="x")
+            gap.pack(fill="x", after=d["blocks"][-1])
         d["gap"] = gap
         steps = max(1, th.timing("drag_gap") // th.timing("frame"))
 
@@ -801,14 +897,13 @@ class SettingsLayout(tk.Frame):
             h = max(1, round(d["h"] * (1 - (1 - e) ** 3)))    # быстро в начале, мягко в конце
             gap.configure(height=h)
             d["gap_h"] = h
-            self._paint_gap(gap, h, d["name"])
+            self._paint_gap(gap, h, d["gap_w"])
             d["job"] = self.after(th.timing("frame"), lambda: step(k + 1)) if k < steps else None
         step(1)
 
-    def _paint_gap(self, gap, h, name=None):
+    def _paint_gap(self, gap, h, w):
         th = self.th
         gap.delete("all")
-        w = self._wrap.winfo_width() - 2 * th.sp(6)
         pad = th.sp(1)
         if h <= 2 * pad + 2:
             return
@@ -836,7 +931,11 @@ class SettingsLayout(tk.Frame):
             return
         kind, val, _ = t
         i = d["i"]
-        if kind == "page":
+        if d["nav"]:
+            if self.editor.place_page(self.navw.rows[i].value, val):
+                self._rebuild()
+                self._flash(self.navw.rows[val - 1 if val > i else val])
+        elif kind == "page":
             if val != self.page and self.editor.move(self.page, i, val):
                 self._rebuild()
                 self._blink_nav(val)
@@ -916,7 +1015,7 @@ class SettingsLayout(tk.Frame):
             if s.extra.get("title_icon") and isinstance(parent, C.SettingRow):
                 parent.add_title_icon(s.extra["title_icon"], bool(shown))
             return C.Toggle(parent, th, shown, on_change=changed, tooltip=s.title,
-                            disabled=bool(en) and not en())
+                            disabled=bool(en) and not en(), danger=bool(s.extra.get("danger")))
         if s.kind == "select":
             return C.Select(parent, th, opts, value, on_change=changed, custom=s.extra.get("custom"))
         if s.kind == "slider":
@@ -963,6 +1062,10 @@ class SettingsLayout(tk.Frame):
             b = C.Button(parent, th, s.extra.get("button", tr("Показать все")), icon="keyboard", variant="secondary")
             b.command = lambda: shortcuts_modal(self.winfo_toplevel(), th, self.reg, s.title, return_focus=b)
             return b
+        if s.kind == "button":                # extra: button — надпись, icon, on_click, enabled
+            en = s.extra.get("enabled")
+            return C.Button(parent, th, s.extra["button"], icon=s.extra.get("icon"), variant="secondary",
+                            command=s.extra["on_click"], disabled=bool(en) and not en())
         raise ValueError(f"Неизвестный вид настройки: {s.kind}")
 
 
@@ -1421,7 +1524,8 @@ class Dialog(tk.Toplevel):
     Enter — основная кнопка, Esc — отмена (value None)."""
 
     def __init__(self, root, th, title, build=None, text=None, buttons=(("OK", "primary", True),),
-                 icon=None, kind="dialog"):
+                 icon=None, kind="dialog", danger=False):
+        """danger=True — опасное решение: красные рамка, заголовок и текст; Enter ничего не подтверждает."""
         super().__init__(root)
         self.withdraw()
         self.th = th
@@ -1432,9 +1536,18 @@ class Dialog(tk.Toplevel):
         self.transient(root)
         self.protocol("WM_DELETE_WINDOW", lambda: self.close(None))
         outer = tk.Frame(self, bg=th.c("surface-raised"), padx=th.sp(6), pady=th.sp(4))
+        if danger:
+            outer.configure(highlightthickness=th.size("focus"), highlightbackground=th.c("danger-fg"),
+                            highlightcolor=th.c("danger-fg"))
         outer.pack(fill="both", expand=True)
         self.body = tk.Frame(outer, bg=th.c("surface-raised"))
         self.body.pack(fill="both", expand=True)
+        if danger:
+            head = tk.Frame(self.body, bg=th.c("surface-raised"))
+            head.pack(anchor="w", pady=(0, th.sp(3)))
+            tk.Label(head, image=get_icon("warning", th.size("icon"), th.c("danger-fg")),
+                     bg=head.cget("bg")).pack(side="left", padx=(0, th.sp(2)))
+            C.Text(head, th, title, "title", "danger", "strong").pack(side="left")
         if text:
             row = tk.Frame(self.body, bg=th.c("surface-raised"))
             row.pack(fill="x")
@@ -1443,7 +1556,8 @@ class Dialog(tk.Toplevel):
                         "success": "success"}[icon]
                 tk.Label(row, image=get_icon(icon, th.size("icon"), th.c(tone)),
                          bg=row.cget("bg")).pack(side="left", anchor="n", padx=(0, th.sp(3)))
-            C.Text(row, th, text, "body", wrap=th.size("dialog_min_w")).pack(side="left", anchor="w")
+            C.Text(row, th, text, "body", "danger" if danger else "primary",
+                   wrap=th.size("dialog_min_w")).pack(side="left", anchor="w")
         if build:
             build(self.body, self)
         foot = tk.Frame(outer, bg=th.c("surface-raised"))
@@ -1496,8 +1610,30 @@ class Dialog(tk.Toplevel):
         return self.result
 
 
-def ask(root, th, title, text, buttons, icon="warning", kind="ask"):
-    return Dialog(root, th, title, text=text, buttons=buttons, icon=icon, kind=kind).wait()
+def changes_list(parent, dlg, th, versions):
+    """Содержимое окна «Что нового». versions: [(номер, [(раздел, [пункты])])], новые сверху."""
+    tone, wrap = "surface-raised", th.size("changes_w")
+    area = C.ScrollArea(parent, th, tone, wheel=False)
+    area.cv.configure(width=wrap + th.sp(3), height=th.size("changes_h"))
+    area.pack(fill="both", expand=True)
+    dlg.bind("<MouseWheel>", lambda e: area.cv.yview_scroll(-e.delta // 120, "units"))
+    for n, (version, sections) in enumerate(versions):
+        C.Text(area.body, th, f"V{version}", "title", weight="strong").pack(
+            anchor="w", pady=(th.sp(6) if n else 0, 0))
+        for title, items in sections:
+            C.Text(area.body, th, tr(title), "body", "secondary", "strong").pack(
+                anchor="w", pady=(th.sp(4), th.sp(1)))
+            for item in items:
+                row = tk.Frame(area.body, bg=th.c(tone))
+                row.pack(fill="x", pady=(th.sp(1), 0))
+                dot = C.Text(row, th, "•", "body", "secondary")
+                dot.pack(side="left", anchor="n", padx=(0, th.sp(2)))
+                C.Text(row, th, tr(item), "body", wrap=wrap - dot.winfo_reqwidth() - th.sp(2)).pack(
+                    side="left", anchor="w")
+
+
+def ask(root, th, title, text, buttons, icon="warning", kind="ask", danger=False):
+    return Dialog(root, th, title, text=text, buttons=buttons, icon=icon, kind=kind, danger=danger).wait()
 
 
 # ==========================================================================

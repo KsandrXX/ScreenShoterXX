@@ -23,6 +23,7 @@ class Overlay(tk.Toplevel):
         self.on_done, self.on_mode = on_done, on_mode
         self.start, self.points, self.box = None, [], None
         self._pending = self._finished = False
+        self.hold = False                   # True — закрывает вызывающий (игра возвращается под оверлеем)
 
         w, h = shot.size
         self.overrideredirect(True)
@@ -177,5 +178,6 @@ class Overlay(tk.Toplevel):
         if self._finished:
             return
         self._finished = True
-        self.destroy()
+        if not self.hold:
+            self.destroy()
         self.on_done(result)

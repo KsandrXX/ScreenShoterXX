@@ -10,7 +10,9 @@ import tkinter as tk
 
 from PIL import Image, ImageChops, ImageDraw, ImageTk
 
+from ..core import winapi as W
 from ..core.colors import hex_to_rgb
+from ..ui import paint
 from ..ui.cursors import cursor
 from ..ui.tokens import ANNOTATION
 
@@ -228,6 +230,18 @@ class EditorModel:
         и всё, что делалось на всю картинку, лагало (B13)."""
         return 0, 0, self.base.width, self.base.height
 
+    @staticmethod
+    def thick(s):
+        """Толщина штриха в пикселях: PIL рисует только целую."""
+        return max(1, int(s["width"] + 0.5))
+
+    @staticmethod
+    def pixel(v, t):
+        """Пиксель снимка, на котором стоит кисть толщиной t в точке v: тот, что вокруг неё
+        рисуется ровно по центру (PIL кладёт линию на (t - 1) // 2 пикселя влево). round(v) уводил
+        точку вправо-вниз от курсора: при увеличении пиксель снимка — несколько пикселей экрана."""
+        return math.floor(v - t / 2 + 0.5) + (t - 1) // 2
+
     @classmethod
     def dab(cls, mask, s, p, q, x0, y0, changed=False):
         """Отрезок штриха p→q в маску mask (L) со сдвигом (x0, y0): линия + круг в конце.
@@ -239,16 +253,21 @@ class EditorModel:
         кисть больше снимка после первой точки уже ничего не добавляет (B16)."""
         w = s["width"]
         r = w / 2
-        a = (round(p[0]), round(p[1]))           # координата СНИМКА: округление «,5» к чётному
-        b = (round(q[0]), round(q[1]))           # не зависит от начала холста
+        t = cls.thick(s)
+        a = (cls.pixel(p[0], t), cls.pixel(p[1], t))   # координата СНИМКА: не зависит от начала холста
+        b = (cls.pixel(q[0], t), cls.pixel(q[1], t))
         pad = int(r) + 5                         # фигура (не дальше r от отрезка) не касается края
         ox, oy = min(a[0], b[0]) - pad, min(a[1], b[1]) - pad
         seg = Image.new("L", (abs(a[0] - b[0]) + 2 * pad + 1, abs(a[1] - b[1]) + 2 * pad + 1), 0)
         d = ImageDraw.Draw(seg)
         A, B = (a[0] - ox, a[1] - oy), (b[0] - ox, b[1] - oy)
         if A != B:
-            d.line((A, B), fill=255, width=max(1, int(w + 0.5)))   # PIL — только целая толщина
-        d.ellipse((B[0] - r, B[1] - r, B[0] + r, B[1] + r), fill=255)
+            d.line((A, B), fill=255, width=t)
+        lo = (B[0] - (t - 1) // 2, B[1] - (t - 1) // 2)   # круг ровно t px там же, где линия:
+        if t == 1:                               # края рамки ellipse входят в круг, и (B - r, B + r)
+            d.point(lo, fill=255)                # давал на 1 px больше (B29); круг в 1 px PIL не рисует
+        else:
+            d.ellipse((lo[0], lo[1], lo[0] + t - 1, lo[1] + t - 1), fill=255)
         px, py = ox - x0, oy - y0
         box = cls._clip((px, py, px + seg.width, py + seg.height), (0, 0) + mask.size)
         if not box:
@@ -266,11 +285,23 @@ class EditorModel:
 
     @classmethod
     def _mask(cls, s, size, x0, y0):
-        """Маска штриха на холсте size со сдвигом (x0, y0)."""
+        """Маска штриха на холсте size со сдвигом (x0, y0). Отрезок кистью 3600 px — это круг на
+        13 Мп, ~9 мс, а щелчок дрогнувшей мышью — сотня точек: повтор такого штриха думал секунду.
+        Поэтому точки, где кисть уже накрыла весь холст, и повторы отрезков не рисуются."""
         mask = Image.new("L", size, 0)
         pts = s["pts"]
+        r = s["width"] / 2 - 2                   # запас на округление края круга
+        far_x = lambda x: max(abs(x - x0), abs(x - x0 - size[0]))
+        far_y = lambda y: max(abs(y - y0), abs(y - y0 - size[1]))
+        seen = set()
+        t = cls.thick(s)
         for p, q in zip([pts[0]] + pts[:-1], pts):
-            cls.dab(mask, s, p, q, x0, y0)
+            seg = (cls.pixel(p[0], t), cls.pixel(p[1], t), cls.pixel(q[0], t), cls.pixel(q[1], t))
+            if math.hypot(far_x(seg[2]), far_y(seg[3])) <= r:
+                return Image.new("L", size, 255)
+            if seg not in seen:
+                seen.add(seg)
+                cls.dab(mask, s, p, q, x0, y0)
         return mask
 
     @staticmethod
@@ -561,7 +592,10 @@ class EditorView(tk.Frame):
         self._out_rough = False                   # линии растянуты на кадре зума — пересчитать в конце
         self._ocache = {}                         # id штриха -> (штрих, снимок, его часть за краем)
         self._live_item = None                    # линия незавершённого штриха за краем
+        self._hand = self._hand_item = None       # стрелка с Shift: конец прямой и её линия (B30)
+        self._length_items = self._length_after = None   # плашка длины и её таймер
         self._key = None                          # (версия модели, вид) показанного кадра
+        self.tk_img = None                        # None — кадра нет: окно в трее (release)
         self.frame_item = self.cv.create_rectangle(0, 0, 0, 0, outline=th.c("border-strong"),
                                                    width=th.size("border"))
         cv = self.cv
@@ -589,6 +623,17 @@ class EditorView(tk.Frame):
     # ------------------------------------------------------------ координаты и масштаб
     def to_img(self, sx, sy):
         return (sx - self.ox) / self.z, (sy - self.oy) / self.z
+
+    def to_pixel(self, sx, sy):
+        """Точка снимка под мышью: середина пикселя экрана от угла ПОКАЗАННОЙ картинки. Это кусок
+        снимка на целом пикселе холста, растянутый до целого размера (см. _render_now): при дробном
+        масштабе расчёт от ox расходился с экраном до 1 px."""
+        z = self.z
+        x0, y0, x1, y1 = self._shown or (0, 0) + self.model.base.size
+
+        def pick(s, o, a, b):
+            return a + (s + 0.5 - math.floor(o + a * z)) * (b - a) / max(1, round((b - a) * z))
+        return pick(sx, self.ox, x0, x1), pick(sy, self.oy, y0, y1)
 
     def _size(self):
         return self.cv.winfo_width(), self.cv.winfo_height()
@@ -767,7 +812,7 @@ class EditorView(tk.Frame):
             size = (max(1, round((x1 - x0) * z)), max(1, round((y1 - y0) * z)))
             self.tk_img = ImageTk.PhotoImage(self._scaled(part, size))
             self.cv.itemconfigure(self.img_item, image=self.tk_img, state="normal")
-            self.cv.coords(self.img_item, round(self.ox + x0 * z), round(self.oy + y0 * z))
+            self.cv.coords(self.img_item, math.floor(self.ox + x0 * z), math.floor(self.oy + y0 * z))
             self._shown = (x0, y0, x1, y1)
         else:
             self.cv.itemconfigure(self.img_item, state="hidden")
@@ -780,6 +825,20 @@ class EditorView(tk.Frame):
         self.cv.tag_raise("ring")
         if self.on_zoom:
             self.on_zoom(z)
+
+    def release(self):
+        """Окно ушло в трей: готовый кадр и кэши отпустить, снимок и пометки остаются в модели
+        (B36). Соберёт restore, перед показом окна."""
+        if self.cur:
+            return
+        self.cv.itemconfigure(self.img_item, image="")
+        self.tk_img = self._key = None
+        self.model.drop_caches()
+
+    def restore(self):
+        """Кадр до показа окна, иначе на миг виден пустой холст."""
+        if self.tk_img is None:
+            self._render_now()
 
     def _changed(self):
         self.schedule()
@@ -889,6 +948,10 @@ class EditorView(tk.Frame):
             self.cv.tag_lower(self._live_item, self.img_item)
         self._out_items = have[:k] + new
         self._out_view = view
+        if self._hand:
+            self._hand_show()
+        elif old != view:                        # плашка стояла бы уже не на своей линии
+            self._length_hide()
 
     def _live_out(self, p, q):
         """Отрезок незавершённого штриха: если штрих вышел за снимок — его линия за краем."""
@@ -936,12 +999,16 @@ class EditorView(tk.Frame):
         if self.cv.focus_get() is not self.cv:
             self._mouse_focus = True
             self.cv.focus_set()   # стрелки после клика двигают холст
-        x, y = self.to_img(e.x, e.y)
+        x, y = self.to_pixel(e.x, e.y)
         if m.tool == "eraser" and not m.eraser_brush:
             if m.erase_at(x, y, extra=5 / self.z):
                 self._changed()
             return
-        self.cur = m.new_erase(x, y) if m.tool == "eraser" else m.new_stroke(x, y)
+        self._length_hide()
+        # Shift+щелчок — прямая от конца последнего штриха (B30): новый штрих, отменяется отдельно
+        shift = self._shift(e)
+        sx, sy = m.strokes[-1]["pts"][-1] if shift and m.strokes else (x, y)
+        self.cur = m.new_erase(sx, sy) if m.tool == "eraser" else m.new_stroke(sx, sy)
         self.live = LiveStroke(m, self.cur, self.th.c("canvas"))
         self._live_item = None
         if self._pending or self._key != (m.version,) + self._view_key():
@@ -951,12 +1018,93 @@ class EditorView(tk.Frame):
         if lv.box and self._shown:
             self._patch(lv._seg(p, p))
         self._live_out(p, p)
+        if shift:
+            self._hand = (x, y)
+            self._hand_show()
+
+    @staticmethod
+    def _shift(e):
+        return bool(getattr(e, "state", 0) & 0x1)
+
+    def _hand_show(self):
+        """Стрелка (B30): пока Shift зажат, прямая от конца штриха крутится за курсором. Это линия
+        холста поверх снимка: в маску штриха прошлое положение попало бы навсегда."""
+        p = self.cur["pts"][-1]
+        fill, width = self._out_style(self.cur)
+        xy = self._out_coords([p, self._hand])
+        if self._hand_item is None:
+            self._hand_item = self.cv.create_line(*xy, fill=fill, width=width, capstyle="round")
+        else:
+            self.cv.coords(self._hand_item, *xy)
+            self.cv.itemconfigure(self._hand_item, fill=fill, width=width)
+        self._length_show(p, self._hand)
+        if self._length_after is None:
+            self._length_after = self.after(self.th.timing("length_poll"), self._length_watch)
+
+    def _hand_commit(self, keep=False):
+        """Стрелку — в штрих: последнее положение становится отрезком. keep — Shift ещё зажат,
+        плашка остаётся."""
+        p, q = self.cur["pts"][-1], self._hand
+        self._hand = None
+        if self._hand_item is not None:
+            self.cv.delete(self._hand_item)
+            self._hand_item = None
+        self._patch(self.live.add(*q))
+        self._live_out(p, q)
+        if p == q or not keep:
+            self._length_hide()
+
+    def _length_watch(self):
+        """Плашка живёт, пока зажат Shift. Опрос, а не <KeyRelease>: Shift могут отпустить,
+        когда фокус на панели или в другой программе."""
+        self._length_after = None
+        if not self.winfo_exists():
+            return
+        if W.shift_held():
+            self._length_after = self.after(self.th.timing("length_poll"), self._length_watch)
+        elif self._hand:
+            self._hand_commit()
+        else:
+            self._length_hide()
+
+    def _length_show(self, p, q):
+        """Плашка длины и угла посередине прямой, как у линеек: под курсором её не видно бы было, а у
+        конца она прыгала бы, пока стрелка крутится. Длина — в пикселях снимка, от масштаба не зависит."""
+        th = self.th
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        text = f"{round(math.hypot(dx, dy))} px"
+        if dx or dy:                             # 0° — вправо, 90° — вверх, против часовой
+            text += f"  ·  {round(math.degrees(math.atan2(-dy, dx))) % 360}°"
+        w, h = th.measure(text, "caption", "strong") + 2 * th.sp(2), th.size("value_chip_h")
+        x = self.ox + (p[0] + q[0]) / 2 * self.z
+        y = self.oy + (p[1] + q[1]) / 2 * self.z
+        x = max(w // 2, min(x, self.cv.winfo_width() - w // 2))      # конец за окном — плашка в окне
+        y = max(h // 2, min(y, self.cv.winfo_height() - h // 2))
+        chip = paint.rounded_rgba(w, h, th.r("md"), th.c("accent"))    # акцент виден на любом снимке
+        if self._length_items is None:
+            self._length_items = (self.cv.create_image(x, y, image=chip),
+                                  self.cv.create_text(x, y, text=text, fill=th.c("text-on-accent"),
+                                                      font=th.font("caption", "strong")))
+            return
+        back, label = self._length_items
+        self.cv.coords(back, x, y)
+        self.cv.coords(label, x, y)
+        self.cv.itemconfigure(back, image=chip)
+        self.cv.itemconfigure(label, text=text)
+
+    def _length_hide(self):
+        if self._length_after is not None:
+            self.after_cancel(self._length_after)
+            self._length_after = None
+        if self._length_items is not None:
+            self.cv.delete(*self._length_items)
+            self._length_items = None
 
     def on_drag(self, e):
         m = self.model
         if not m.base:
             return
-        x, y = self.to_img(e.x, e.y)
+        x, y = self.to_pixel(e.x, e.y)
         self._ring_at(e)
         if m.tool == "eraser" and not m.eraser_brush:
             if m.erase_at(x, y, extra=5 / self.z):
@@ -964,6 +1112,12 @@ class EditorView(tk.Frame):
             return
         if not self.live:
             return
+        if self._shift(e):
+            self._hand = (x, y)
+            self._hand_show()
+            return
+        if self._hand:
+            self._hand_commit()
         p = self.cur["pts"][-1]
         if abs(p[0] - x) * self.z < 1 and abs(p[1] - y) * self.z < 1:
             return
@@ -973,6 +1127,8 @@ class EditorView(tk.Frame):
     def on_release(self, e):
         if not self.cur:
             return
+        if self._hand:
+            self._hand_commit(keep=self._shift(e))
         # модель обновит только прямоугольник нового штриха — готовым результатом из буфера
         m = self.model
         fresh = not self._pending and self._key == (m.version,) + self._view_key()

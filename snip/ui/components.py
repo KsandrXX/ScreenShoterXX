@@ -63,8 +63,8 @@ def note_mouse():
 
 
 def esc_quiet():
-    """Esc, а по Tab до этого не ходили: кольцо не показывать."""
-    return INPUT["last"] == "key" and INPUT["key"] == "Escape" and not INPUT["nav"]
+    """Esc или Enter, а по Tab до этого не ходили: кольцо не показывать."""
+    return INPUT["last"] == "key" and INPUT["key"] in ("Escape", "Return") and not INPUT["nav"]
 
 
 def focus_auto(widget):
@@ -126,10 +126,24 @@ def Text(parent, th, text="", role="body", tone="primary", weight="regular", wra
                     wraplength=wrap or 0, bd=0, padx=0, pady=0)
 
 
-def Divider(parent, th, vertical=False, pad=2):
-    d = tk.Frame(parent, bg=th.c("border"), width=th.size("border"), height=th.size("border"))
+def Link(parent, th, text, command, role="caption", tone="danger", wrap=0):
+    """Подчёркнутый текст, который можно нажать: мышь, либо Tab и Space/Enter. Рамка — только при фокусе,
+    а клик фокус не берёт, поэтому она появляется лишь с клавиатуры."""
+    w = Text(parent, th, text, role, tone, wrap=wrap)
+    w.configure(font=th.font(role, underline=True), cursor="hand2", takefocus=1,
+                highlightthickness=th.size("border"), highlightbackground=w.cget("bg"),
+                highlightcolor=th.c("focus-ring"))
+    for seq in ("<Button-1>", "<Return>", "<space>"):
+        w.bind(seq, lambda e: command())
+    return w
+
+
+def Divider(parent, th, vertical=False, pad=2, length=None, color="border"):
+    d = tk.Frame(parent, bg=th.c(color), width=th.size("border"), height=th.size("border"))
     if vertical:
         d.configure(width=th.size("border"))
+        if length:
+            d.configure(height=length)
     return d
 
 
@@ -243,8 +257,8 @@ class Tooltip:
     """Всплывающая подсказка (слой popup): название жирным, пояснение, клавиша справа в строке
     названия, у размера — образец линии (`tooltip_body`). Показывается при наведении (и у
     недоступных контролов — объясняет причину) и при фокусе с клавиатуры. Без тени и анимации.
-    Место — под виджетом, левым краем по его левому краю; не влезает справа — правым краем
-    по правому краю виджета."""
+    Место — под виджетом и под стрелкой курсора, левым краем по его левому краю; не влезает
+    справа — правым краем по правому краю виджета, снизу — над виджетом."""
 
     # Настоящее положение виджета на экране f(widget) -> (x, y, w, h); программа подключает
     # WinAPI. Нужно внутри переподчинённых окон (модальная карточка), где winfo_root* у Tk неверны.
@@ -301,11 +315,16 @@ class Tooltip:
         ring = getattr(self.w, "ring", 0)    # поле под кольцо фокуса — не часть кнопки
         x, y, w, h = x + ring, y + ring, w - 2 * ring, h - 2 * ring
         tw = t.winfo_reqwidth()
-        _l, _t, r, _b = (Popup.screen_bounds(x, y) if Popup.screen_bounds else
-                         (0, 0, self.w.winfo_screenwidth(), self.w.winfo_screenheight()))
+        _l, _t, r, b = (Popup.screen_bounds(x, y) if Popup.screen_bounds else
+                        (0, 0, self.w.winfo_screenwidth(), self.w.winfo_screenheight()))
         if x + tw > r:                    # не влезает справа — правым краем по правому краю кнопки
             x = x + w - tw
-        t.geometry(f"+{x}+{y + h + th.sp(1)}")
+        below = y + h + th.sp(1)
+        px, py = self.w.winfo_pointerxy()
+        if x <= px < x + max(w, tw) and y <= py < below:
+            below = max(below, py + th.size("tooltip_cursor"))   # стрелка курсора не закрывает начало текста
+        tip_h = t.winfo_reqheight()
+        t.geometry(f"+{x}+{below if below + tip_h <= b else y - tip_h - th.sp(1)}")
         t.deiconify()
         self.tip = t
 
@@ -461,6 +480,8 @@ class Control(tk.Canvas):
 
     def _on_focus(self, _):
         self.focused = True
+        if INPUT["last"] == "mouse" or esc_quiet():   # фокус вернулся сам, когда закрыли окно поверх
+            self._quiet = True
         self.paint()
 
     def _on_blur(self, _):
@@ -484,7 +505,7 @@ class Control(tk.Canvas):
     def paint(self):
         raise NotImplementedError
 
-    def _bg_image(self, fill, border=None, radius=None, w=None, h=None):
+    def _bg_image(self, fill, border=None, radius=None, w=None, h=None, x=None):
         th = self.th
         w = w or self.W
         h = h or self.H
@@ -492,12 +513,14 @@ class Control(tk.Canvas):
         bw = th.size("border") if border else 0
         if self.is_focus:   # кольцо фокуса занимает поле self.ring вокруг фигуры
             img = paint.rounded(w, h, radius, fill, self.bg, border=border, border_w=bw,
-                                ring=th.c("focus-ring"), ring_w=th.size("focus"), ring_gap=1)
+                                ring=th.c("danger-fg" if getattr(self, "danger", False)
+                                          or getattr(self, "variant", "") == "danger" else "focus-ring"),
+                                ring_w=th.size("focus"), ring_gap=1)
             self.create_image(0, 0, anchor="nw", image=img)
         else:
             img = paint.rounded(w - 2 * self.ring, h - 2 * self.ring, radius, fill, self.bg,
                                 border=border, border_w=bw)
-            self.create_image(self.ring, self.ring, anchor="nw", image=img)
+            self.create_image(self.ring if x is None else x, self.ring, anchor="nw", image=img)
 
     def _spinner(self, cx, cy, color):
         r = self.th.size("icon_sm") // 2 - 1
@@ -509,12 +532,13 @@ class Control(tk.Canvas):
 # Кнопки
 # ==========================================================================
 class Button(Control):
-    """variant: primary | secondary | ghost | danger. size: sm | md | lg."""
+    """variant: primary | secondary | ghost | danger. size: sm | md | lg.
+    trim: столько px срезать справа (подложка доходит до края; название и цвет за линией, B31)."""
 
     def __init__(self, parent, th, text="", *, icon=None, variant="secondary", size="md",
-                 width=None, **kw):
+                 width=None, trim=0, **kw):
         self.text, self.icon_name, self.variant = text, icon, variant
-        self._fixed_w = width
+        self._fixed_w, self.trim = width, trim
         h = th.size({"sm": "control_sm", "md": "control", "lg": "control_lg"}[size])
         ring = th.size("focus") + 1
         super().__init__(parent, th, width or self._natural_w(th, text, icon), h + 2 * ring, **kw)
@@ -524,7 +548,7 @@ class Button(Control):
         isz = th.size("icon_sm")
         content = (isz if icon else 0) + (th.sp(2) if icon and text else 0) + \
             (th.measure(text, "body", "strong" if self.variant == "primary" else "regular") if text else 0)
-        return content + 2 * th.sp(3) + 2 * (th.size("focus") + 1)
+        return content + 2 * th.sp(3) + 2 * (th.size("focus") + 1) - self.trim
 
     def relabel(self, text, icon=None):
         """Сменить подпись/иконку с пересчётом ширины."""
@@ -567,8 +591,12 @@ class Button(Control):
         self.delete("all")
         th = self.th
         fill, border, fg = self.colors()
-        self._bg_image(fill, border)
-        cx, cy = self.W // 2, self.H // 2
+        if self.trim and not self.is_focus:
+            # подложка ровная: до названия слева столько же, сколько справа до линии
+            self._bg_image(fill, border, w=self.W + 2 * self.ring - self.trim, x=self.trim)
+        else:
+            self._bg_image(fill, border)
+        cx, cy = (self.W + self.trim) // 2, self.H // 2
         isz = th.size("icon_sm")
         weight = "strong" if self.variant == "primary" else "regular"
         tw = th.measure(self.text, "body", weight) if self.text else 0
@@ -654,8 +682,8 @@ class IconButton(Button):
 # Переключатели
 # ==========================================================================
 class Toggle(Control):
-    def __init__(self, parent, th, value=False, on_change=None, **kw):
-        self.value, self.on_change = bool(value), on_change
+    def __init__(self, parent, th, value=False, on_change=None, danger=False, **kw):
+        self.value, self.on_change, self.danger = bool(value), on_change, danger
         ring = th.size("focus") + 1
         super().__init__(parent, th, th.size("toggle_w") + 2 * ring, th.size("toggle_h") + 2 * ring, **kw)
         self.paint()
@@ -678,6 +706,11 @@ class Toggle(Control):
         h = self.H - 2 * self.ring
         if self.disabled:
             fill, knob, border = th.c("control"), th.c("text-disabled"), th.c("border")
+        elif self.danger and self.value:
+            fill = th.c("danger-hover" if self.is_hover else "danger")
+            knob, border = th.c("text-on-danger"), None
+        elif self.danger:
+            fill, knob, border = th.c("control-pressed"), th.c("danger-fg"), th.c("danger-fg")
         elif self.value:
             fill = th.c("accent-hover" if self.is_hover else "accent")
             knob, border = th.c("text-on-accent"), None
@@ -1082,16 +1115,25 @@ class HotkeyField(Control):
         is_fn = key.startswith("F") and key[1:].isdigit() or key in ("Print", "Pause", "Scroll_Lock")
         if not mods and not is_fn:
             return "break"  # одиночная клавиша глобально перехватила бы ввод
+        self._commit(mods, key)
+        return "break"
+
+    def take(self, mods, vk):
+        """Сочетание, которое поймал сильный режим: занятое другой программой до поля не доходит."""
+        key = self._vk_name(vk)
+        if self.capturing and key:
+            self._commit(mods, key)
+
+    def _commit(self, mods, key):
         if self._win or key in self.RESERVED:
             self._stop()
             if self.on_reject:
                 self.on_reject(tr("Сочетания с Win заняты Windows — выберите другое") if self._win
                                else tr(self.RESERVED[key]))
-            return "break"
+            return
         # сначала снять паузу глобальных клавиш, потом назначать: регистрация видит новое сразу
         self._stop()
         self._set("+".join(mods + [key]))
-        return "break"
 
     # Клавишу берём по коду клавиши Windows, а не по символу: в русской раскладке keysym
     # был бы «Cyrillic_o», с Shift — «exclam», и RegisterHotKey такое не принимает.
@@ -1235,10 +1277,10 @@ class PathField(tk.Frame):
 # Списки, выпадающие списки, вкладки
 # ==========================================================================
 class ListRow(Control):
-    """Строка списка/меню: иконка, текст, подсказка справа (горячая клавиша)."""
+    """Строка списка/меню: иконка, текст, подсказка справа (горячая клавиша) или значок trail."""
 
-    def __init__(self, parent, th, text, *, icon=None, hint=None, width=None, **kw):
-        self.text, self.icon_name, self.hint = text, icon, hint
+    def __init__(self, parent, th, text, *, icon=None, hint=None, width=None, trail=None, **kw):
+        self.text, self.icon_name, self.hint, self.trail = text, icon, hint, trail
         ring = th.size("focus") + 1
         isz = th.size("icon_sm")
         w = width or (2 * ring + 2 * th.sp(3) + (isz + th.sp(2) if icon else 0) + th.measure(text)
@@ -1274,20 +1316,29 @@ class ListRow(Control):
         if self.hint:
             self.create_text(self.W - self.ring - th.sp(3), cy, anchor="e", text=self.hint,
                              fill=th.c("text-secondary"), font=th.font("caption"))
+        if self.trail:
+            self.create_image(self.W - self.ring - th.sp(2), cy, anchor="e",
+                              image=get_icon(self.trail, th.size("icon_sm"), th.c("text-secondary")))
 
 
 class ListView(tk.Frame):
-    """Вертикальный список с одиночным выбором. items: [(value, text, icon, hint)]."""
+    """Вертикальный список с одиночным выбором. items: [(value, text, icon, hint)].
+    bottom — значения в конце items, прижатые к низу списка (списку нужна высота: fill="y")."""
 
-    def __init__(self, parent, th, items, value=None, on_select=None, width=None, selectable=True):
+    def __init__(self, parent, th, items, value=None, on_select=None, width=None, selectable=True, trail=None,
+                 bottom=()):
         super().__init__(parent, bg=parent_bg(parent))
         self.th, self.on_select, self.value, self.rows = th, on_select, value, []
         self.selectable = selectable
         width = width or max([0] + [ListRow(self, th, t, icon=i, hint=h).W for _, t, i, h in items])
         for w in self.winfo_children():
             w.destroy()
+        spacer = False
         for v, t, i, h in items:
-            r = ListRow(self, th, t, icon=i, hint=h, width=width,
+            if v in bottom and not spacer:
+                spacer = True
+                tk.Frame(self, bg=self.cget("bg")).pack(fill="both", expand=True)
+            r = ListRow(self, th, t, icon=i, hint=h, width=width, trail=None if v in bottom else trail,
                         selected=selectable and v == value, command=lambda v=v: self.select(v, True))
             r.value = v
             r.bind("<Up>", lambda e, r=r: self._move(r, -1))
@@ -2333,15 +2384,22 @@ class Select(Control):
 
 
 class Tabs(tk.Frame):
-    """Горизонтальные вкладки. items: [(value, text)]. Стрелки — переключение."""
+    """Горизонтальные вкладки. items: [(value, text)]. Стрелки — переключение.
+    end: {value: значок} — вкладки значком у правого края (текст — в подсказке): им хватает места всегда,
+    вкладкам нужна ширина (fill="x")."""
 
-    def __init__(self, parent, th, items, value, on_change=None):
+    def __init__(self, parent, th, items, value, on_change=None, end=None):
         super().__init__(parent, bg=parent_bg(parent))
         self.th, self.value, self.on_change, self.tabs = th, value, on_change, []
+        end = end or {}
         for v, t in items:
-            tab = _Tab(self, th, t, v)
-            tab.pack(side="left")
-            self.tabs.append(tab)
+            self.tabs.append(_Tab(self, th, t, v, end.get(v)))
+        for tab in self.tabs:                  # первыми: упаковка раздаёт место по порядку
+            if tab.icon_name:
+                tab.pack(side="right")
+        for tab in self.tabs:
+            if not tab.icon_name:
+                tab.pack(side="left")
 
     def select(self, v, notify=False):
         self.value = v
@@ -2357,11 +2415,12 @@ class Tabs(tk.Frame):
 
 
 class _Tab(Control):
-    def __init__(self, tabs, th, text, value):
-        self.tabs, self.text, self.value = tabs, text, value
+    def __init__(self, tabs, th, text, value, icon=None):
+        self.tabs, self.text, self.value, self.icon_name = tabs, text, value, icon
         ring = th.size("focus") + 1
-        super().__init__(tabs, th, th.measure(text, "body", "strong") + 2 * th.sp(3) + 2 * ring,
-                         th.size("control") + 2 * ring, command=lambda: tabs.select(value, True))
+        w = th.size("control") if icon else th.measure(text, "body", "strong") + 2 * th.sp(3)
+        super().__init__(tabs, th, w + 2 * ring, th.size("control") + 2 * ring,
+                         command=lambda: tabs.select(value, True), tooltip=text if icon else None)
         self.bind("<Left>", lambda e: (tabs.move(self, -1), "break")[1])
         self.bind("<Right>", lambda e: (tabs.move(self, 1), "break")[1])
         self.paint()
@@ -2373,8 +2432,11 @@ class _Tab(Control):
         fill = th.c("control-hover") if self.is_hover and not on else self.bg
         self._bg_image(fill, None, radius=th.r("sm"))
         fg = th.c("text-primary") if on or self.is_hover else th.c("text-secondary")
-        self.create_text(self.W // 2, self.H // 2, text=self.text, fill=fg,
-                         font=th.font("body", "strong" if on else "regular"))
+        if self.icon_name:
+            self.create_image(self.W // 2, self.H // 2, image=get_icon(self.icon_name, th.size("icon_sm"), fg))
+        else:
+            self.create_text(self.W // 2, self.H // 2, text=self.text, fill=fg,
+                             font=th.font("body", "strong" if on else "regular"))
         if on:
             b = th.size("focus")
             self.create_rectangle(self.ring + th.sp(2), self.H - self.ring - b,
@@ -2444,9 +2506,10 @@ class Scrollbar(tk.Canvas):
 
 
 class ScrollArea(tk.Frame):
-    """Прокручиваемая по вертикали область. Содержимое — в .body."""
+    """Прокручиваемая по вертикали область. Содержимое — в .body. wheel=False — колесо мыши
+    настраивает окно: привязка на всю программу не переживёт закрытия диалога."""
 
-    def __init__(self, parent, th, tone="surface"):
+    def __init__(self, parent, th, tone="surface", wheel=True):
         super().__init__(parent, bg=th.c(tone))
         self.cv = tk.Canvas(self, bg=th.c(tone), highlightthickness=0, bd=0)
         self.sb = Scrollbar(self, th, "vertical", self.cv.yview)
@@ -2457,7 +2520,8 @@ class ScrollArea(tk.Frame):
         self.win = self.cv.create_window(0, 0, anchor="nw", window=self.body)
         self.body.bind("<Configure>", lambda e: self.cv.configure(scrollregion=self.cv.bbox("all")))
         self.cv.bind("<Configure>", lambda e: self.cv.itemconfigure(self.win, width=e.width))
-        self.bind_all_wheel()
+        if wheel:
+            self.bind_all_wheel()
 
     def bind_all_wheel(self):
         def wheel(e):
@@ -2632,20 +2696,25 @@ class SettingRow(tk.Frame):
     """Строка настройки: название + описание слева, контрол справа."""
 
     def __init__(self, parent, th, title, description=None, build=None, error=None, wrap=None,
-                 stacked=False, avail=None):
+                 stacked=False, avail=None, danger=False):
         """stacked=True — контрол всегда под подписью; иначе переносится под подпись
-        автоматически, когда не помещается справа."""
+        автоматически, когда не помещается справа. danger=True — опасная настройка: рамка и красный текст."""
         super().__init__(parent, bg=parent_bg(parent))
-        self.th, self.force_stacked, self.stacked = th, stacked, None
+        self.th, self.force_stacked, self.stacked, self.danger = th, stacked, None, danger
+        self.pad = th.sp(3) if danger else 0
+        if danger:
+            self.configure(padx=self.pad, highlightthickness=th.size("border"),
+                           highlightbackground=th.c("danger-fg"), highlightcolor=th.c("danger-fg"))
         self.left = left = tk.Frame(self, bg=self.cget("bg"))
-        self.title_label = Text(left, th, title, "body")
+        self.title_label = Text(left, th, title, "body", "danger" if danger else "primary",
+                                "strong" if danger else "regular")
         self.title_label.pack(anchor="w")
         wrap = wrap or th.size("row_min_w") // 2
         self.wrap = wrap
         self.desc = None
         self.title_icon = None
         if description:
-            self.desc = Text(left, th, description, "caption", "secondary", wrap=wrap)
+            self.desc = Text(left, th, description, "caption", "danger" if danger else "secondary", wrap=wrap)
             self.desc.pack(anchor="w")
         self.err = None
         self.set_error(error)
@@ -2653,6 +2722,8 @@ class SettingRow(tk.Frame):
         if not stacked and avail and self.control is not None:   # сразу верная раскладка
             self.control.update_idletasks()
             stacked = avail < self._need()
+            if danger and self.desc is not None:   # текст длинный: на всю ширину до контрола, а не узкой колонкой
+                self.desc.configure(wraplength=max(wrap, avail - 2 * self.pad - self.control.winfo_reqwidth() - th.sp(6)))
         self._arrange(stacked)
         if not self.force_stacked:
             self.bind("<Configure>", self._on_resize)
@@ -2677,23 +2748,26 @@ class SettingRow(tk.Frame):
 
     def paint_title_icon(self, on):
         th = self.th
-        img = icon_tight(self._title_icon_name, th.size("title_icon"), th.c("icon-on" if on else "text-secondary"),
-                         th.icon_stroke("stroke_on") if on else None)
+        color = th.c("danger-fg" if self.danger else "icon-on" if on else "text-secondary")
+        img = icon_tight(self._title_icon_name, th.size("title_icon"), color, th.icon_stroke("stroke_on") if on else None)
         self.title_icon.configure(image=img)
         self._title_slot.configure(width=img.width())
         self.title_icon.img = img              # держать картинку, иначе её соберёт сборщик мусора
 
     def set_error(self, text):
-        """Текст ошибки под описанием (None — убрать)."""
+        """Текст ошибки под описанием (None — убрать); (текст, по клику) — подчёркнутая ссылка."""
         if self.err is not None:
             self.err.destroy()
             self.err = None
-        if text:
+        if isinstance(text, tuple):
+            self.err = Link(self.left, self.th, text[0], text[1], wrap=self.wrap)
+        elif text:
             self.err = Text(self.left, self.th, text, "caption", "danger", wrap=self.wrap)
+        if self.err is not None:
             self.err.pack(anchor="w")
 
     def _need(self):
-        return self.th.size("row_min_w") // 2 + self.control.winfo_reqwidth() + self.th.sp(4)
+        return self.th.size("row_min_w") // 2 + self.control.winfo_reqwidth() + self.th.sp(4) + 2 * self.pad
 
     def _on_resize(self, e):
         if self.control is None or e.width <= 1:

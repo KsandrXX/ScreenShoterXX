@@ -6,6 +6,7 @@
 запись сюда (см. DESIGN.md, раздел «Как добавить»). Экраны трогать не нужно.
 """
 
+from ..core import winapi as W
 from ..core.i18n import tr
 from ..ui.tokens import THEME_NAMES
 
@@ -89,11 +90,11 @@ def register(app, reg):
     reg.action("pen", tr("Перо"), icon="pen", surface="editor", group="tools", kind="tool", freq=3, value=3,
                order=1, hotkey="P", get=tool_get, set=app.set_tool)
     reg.action("pen_color", tr("Цвет пера"), surface="editor", group="tools", kind="color", freq=3, value=3,
-               order=2, get=lambda: s["pen_color"], handler=lambda f: app.pick_color("pen_color", f))
+               order=2, sep=True, get=lambda: s["pen_color"], handler=lambda f: app.pick_color("pen_color", f))
     reg.action("marker", tr("Маркер"), icon="marker", surface="editor", group="tools", kind="tool",
                freq=3, value=3, order=3, hotkey="M", get=tool_get, set=app.set_tool)
     reg.action("marker_color", tr("Цвет маркера"), surface="editor", group="tools", kind="color", freq=3,
-               value=3, order=4, get=lambda: s["marker_color"],
+               value=3, order=4, sep=True, get=lambda: s["marker_color"],
                handler=lambda f: app.pick_color("marker_color", f))
     # Ластик: клик — выбрать в текущем режиме; удержание — меню режимов; E — ластик,
     # повторное E или Shift+E — сменить режим. Иконка показывает режим.
@@ -102,6 +103,7 @@ def register(app, reg):
                tooltip=tr("Стирает только пометки. Удерживайте для смены режима"),
                label=lambda: (tr("Ластик"), "eraser" if s["eraser_mode"] == "brush" else "eraser_object"),
                get=tool_get, set=app.set_tool, hold=app.eraser_menu, key=app.eraser_key)
+    reg.mouse_key(tr("Прямая линия"), tr("Shift+щелчок"), "Инструменты")
     # Размер и непрозрачность — у выбранного инструмента свои; нет параметра — поле неактивно
 
     def size_sample():
@@ -130,7 +132,7 @@ def register(app, reg):
                show_label=False, hotkey="Ctrl+Z", handler=app.undo,
                enabled=lambda: bool(app.model.history))
     reg.action("redo", tr("Повторить"), icon="redo", surface="editor", group="history", freq=2, value=2,
-               order=1, show_label=False, hotkey="Ctrl+Y", alt_hotkeys=("Ctrl+Shift+Z",),
+               order=1, show_label=False, hotkey="Ctrl+X", alt_hotkeys=("Ctrl+Y", "Ctrl+Shift+Z"),
                tooltip=tr("Вернуть отменённое"), handler=app.redo, enabled=lambda: bool(app.model.redo_stack))
     reg.action("clear", tr("Очистить пометки"), icon="trash", surface="editor", group="history",
                freq=1, value=2, handler=app.clear_marks, enabled=lambda: bool(app.model.strokes))
@@ -162,9 +164,11 @@ def register(app, reg):
 
     # ---------------------------------------------------------------- настройки
     reg.page("capture", tr("Снимки"), icon="snip", order=10)
+    reg.page("editor", tr("Редактор"), icon="pen", order=15)
     reg.page("gif", tr("Запись GIF"), icon="film", order=20)
     reg.page("appearance", tr("Внешний вид"), icon="palette", order=30)
     reg.page("hotkeys", tr("Клавиши"), icon="keyboard", order=40)
+    reg.page("about", tr("О программе"), icon="info", order=50, bottom=True)
 
     # каждый новый снимок всегда копируется в буфер обмена (настройки «Копировать снимок в буфер» нет)
     reg.setting("snip_save", tr("Сохранять снимок в папку"), "capture", kind="toggle", order=0, default=False,
@@ -178,8 +182,11 @@ def register(app, reg):
     reg.setting("snip_name", tr("Имя файла"), "capture", kind="info", order=2,
                 description=tr("Номер растёт с каждым снимком и не повторяется"),
                 text=lambda: s.file_name("Снимок", s.next_snip_number(), "png"))
+    reg.setting("snip_autosave", tr("Автосохранение правок"), "editor", kind="toggle", order=0, default=True,
+                description=tr("Пометки на снимке сразу попадают в буфер обмена, и при закрытии вопроса нет. "
+                               "Файл в папке не меняется. Выключено — только по кнопке «Копировать»"))
     # в settings.json — copy_on_close (молча копировать пометки), в окне — наоборот: «защита» = вопрос
-    reg.setting("copy_on_close", tr("Защита от случайного закрытия"), "capture", kind="toggle", order=3,
+    reg.setting("copy_on_close", tr("Защита от случайного закрытия"), "editor", kind="toggle", order=1,
                 default=True, extra={"invert": True},
                 description=tr("Закрыли окно или сделали новый снимок, а на снимке есть пометки, — "
                             "спросить «Сохранить?». Выключено — снимок с пометками молча копируется в буфер"))
@@ -219,36 +226,38 @@ def register(app, reg):
                 on_change=lambda v: app.set_language())
 
     def hk_error(key):
-        return lambda: None if app.hotkeys.status.get(key, True) else \
-            tr("Сочетание занято другой программой — выберите другое")
+        return lambda: None if app.hotkeys.status.get(key, True) else app.hotkey_problem(app.settings[key])
 
-    # в settings.json — hotkey_silent (не показывать окно), в окне — наоборот: «показывать»
-    reg.setting("hotkey_silent", tr("Показывать окно редактора после клавиши"), "hotkeys", kind="toggle", order=0,
-                default=False, extra={"invert": True},
-                description=tr("Снимок и GIF по глобальной клавише открываются в окне программы. Выключено — "
-                            "окно остаётся как было (например, свёрнутым), результат — в буфере обмена"))
-    reg.setting("hk_snip", tr("Новый снимок — везде"), "hotkeys", kind="hotkey", order=1,
+    reg.setting("hk_snip", tr("Снимок с редактором — везде"), "hotkeys", kind="hotkey", order=0,
                 description=tr("Работает, даже когда окно программы не активно"),
                 extra={"on_capture": app.hotkeys.pause, "error": hk_error("hk_snip"),
                        "apply": lambda v: app.set_global_hotkey("hk_snip", v)})
+    reg.setting("hk_quick", tr("Снимок без редактора — везде"), "hotkeys", kind="hotkey", order=1,
+                description=tr("Выбранная область — сразу в буфер обмена, окно редактора не открывается"),
+                extra={"on_capture": app.hotkeys.pause, "error": hk_error("hk_quick"),
+                       "apply": lambda v: app.set_global_hotkey("hk_quick", v)})
     reg.setting("hk_full", tr("Снимок всего экрана — везде"), "hotkeys", kind="hotkey", order=2,
-                description=tr("Монитор под курсором — сразу в редактор, без выбора области"),
+                description=tr("Монитор под курсором — сразу в буфер обмена, без выбора области и редактора"),
                 extra={"on_capture": app.hotkeys.pause, "error": hk_error("hk_full"),
                        "apply": lambda v: app.set_global_hotkey("hk_full", v)})
-    reg.setting("hk_gif", tr("Запись GIF / стоп — везде"), "hotkeys", kind="hotkey", order=3,
+    reg.setting("hk_full_edit", tr("Весь экран с редактором — везде"), "hotkeys", kind="hotkey", order=3,
+                description=tr("Монитор под курсором — снимок сразу открывается в редакторе"),
+                extra={"on_capture": app.hotkeys.pause, "error": hk_error("hk_full_edit"),
+                       "apply": lambda v: app.set_global_hotkey("hk_full_edit", v)})
+    reg.setting("hk_gif", tr("Запись GIF / стоп — везде"), "hotkeys", kind="hotkey", order=4,
                 description=tr("Enter — изменить, Backspace или ✕ — отключить"),
                 extra={"on_capture": app.hotkeys.pause, "error": hk_error("hk_gif"),
                        "apply": lambda v: app.set_global_hotkey("hk_gif", v)})
-    reg.setting("shortcuts", tr("Клавиши в окне"), "hotkeys", kind="shortcuts", order=4,
+    reg.setting("shortcuts", tr("Клавиши в окне"), "hotkeys", kind="shortcuts", order=5,
                 description=tr("Собираются автоматически из всех действий"),
                 extra={"button": tr("Показать все")})
     # работа в фоне (B19): рядом с глобальными сочетаниями — без трея они живут, только пока открыто окно
-    reg.setting("tray", tr("Значок в трее"), "hotkeys", kind="toggle", order=5, default=False,
+    reg.setting("tray", tr("Значок в трее"), "hotkeys", kind="toggle", order=6, default=False,
                 section=tr("Работа в фоне"),
                 description=tr("Закрытие окна прячет программу в трей — глобальные сочетания работают дальше. "
                             "Открыть — двойной клик по значку, выйти — правый клик → «Выход»"),
                 on_change=lambda v: app.tray_changed())
-    reg.setting("autostart", tr("Автозапуск вместе с Windows"), "hotkeys", kind="toggle", order=6, default=False,
+    reg.setting("autostart", tr("Автозапуск вместе с Windows"), "hotkeys", kind="toggle", order=7, default=False,
                 section=tr("Работа в фоне"),
                 description=lambda st: (tr("При входе в Windows программа запускается сразу в трее")
                                         if st["tray"] else
@@ -256,3 +265,21 @@ def register(app, reg):
                                         tr("Доступно, когда включено «{}»").format(reg.settings["tray"].title)),
                 extra={"enabled": lambda: bool(s["tray"])},
                 on_change=lambda v: app.autostart_changed())
+    reg.setting("hk_force", tr("Сильный режим сочетаний"), "hotkeys", kind="toggle", order=8, default=False,
+                description=lambda st: (
+                    tr("Занятые сочетания программа забирает себе, пока запущена: другие программы их не получат. "
+                       "Антивирус может принять это за кейлоггер.\n")
+                    + (tr("Программа запущена от имени администратора: сочетания работают во всех окнах")
+                       if W.is_admin() else
+                       tr("Режим работает от имени администратора: при включении Windows спросит разрешение"))),
+                extra={"danger": True, "title_icon": "warning"}, on_change=lambda v: app.force_changed())
+
+    up = app.updater
+    reg.setting("about_version", tr("Версия"), "about", kind="info", order=0, text=lambda: "V" + up.version)
+    reg.setting("about_author", tr("Автор"), "about", kind="info", order=1, text=lambda: "KsandrXX")
+    reg.setting("about_update", tr("Обновление"), "about", kind="button", order=2, description=up.description,
+                extra={"button": tr("Обновить приложение"), "icon": "download", "on_click": up.start,
+                       "enabled": lambda: up.available() and not up.busy(), "error": lambda: up.error})
+    reg.setting("about_changes", tr("Что нового"), "about", kind="button", order=3,
+                description=tr("Что менялось от версии к версии"),
+                extra={"button": tr("Список изменений"), "on_click": app.show_changes})

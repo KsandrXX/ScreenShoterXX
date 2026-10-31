@@ -6,12 +6,14 @@ import time
 
 from PIL import Image
 
+from .dxgi import Duplicator
 from .winapi import grab
 
 
 class GifCapture:
     MEMORY_BUDGET = 1_500_000_000  # ~1.5 ГБ на кадры (1 байт/пиксель)
     MIN_FRAME_MS = 20              # браузеры показывают кадры короче 20 мс как 100 мс
+    DXGI_RETRY_S = 1.0             # захват потерян (игра сменила режим экрана) — как часто пробовать снова
 
     def __init__(self, x, y, w, h, fps=10, scale=1.0, cursor=True, limit=0):
         self.x, self.y, self.w, self.h = x, y, w, h
@@ -26,6 +28,8 @@ class GifCapture:
         self.pause_start = 0.0
         self.paused_total = 0.0
         self.t_start = time.perf_counter()
+        self.dup = None                         # Desktop Duplication (B38); None — кадры через GDI
+        self.dup_retry = None                   # когда снова открыть потерянный захват
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
     def start(self, warmup=0.15):
@@ -33,7 +37,39 @@ class GifCapture:
         self.t_start = time.perf_counter() + warmup   # отсчёт — с первого кадра
         self.thread.start()
 
+    def _open_dup(self):
+        try:
+            self.dup = Duplicator(self.x, self.y, self.w, self.h)
+        except Exception:                       # старая система, два монитора, поворот — останется GDI
+            self.dup = None
+
+    def _close_dup(self):
+        if self.dup:
+            self.dup.close()
+            self.dup = None
+
+    def _frame(self):
+        """Кадр: Desktop Duplication видит полноэкранные игры, GDI — нет (B38: «0,02 fps»).
+        Захват потерян посреди записи — кадры идут через GDI, раз в DXGI_RETRY_S — попытка вернуть."""
+        if self.dup is None and self.dup_retry and time.perf_counter() >= self.dup_retry:
+            self._open_dup()
+            self.dup_retry = None if self.dup else time.perf_counter() + self.DXGI_RETRY_S
+        if self.dup is not None:
+            try:
+                return self.dup.grab(cursor=self.cursor)
+            except Exception:
+                self._close_dup()
+                self.dup_retry = time.perf_counter() + self.DXGI_RETRY_S
+        return grab(self.x, self.y, self.w, self.h, cursor=self.cursor)
+
     def _loop(self):
+        self._open_dup()                        # в потоке записи: объект живёт в одном потоке
+        try:
+            self._record()
+        finally:
+            self._close_dup()
+
+    def _record(self):
         interval = 1.0 / self.fps
         time.sleep(self.warmup)
         next_t = time.perf_counter()
@@ -47,7 +83,7 @@ class GifCapture:
                 self.limit_reached = True       # время вышло: больше кадров не снимаем
                 break
             try:
-                img = grab(self.x, self.y, self.w, self.h, cursor=self.cursor)
+                img = self._frame()
                 if self.scale != 1:
                     img = img.resize((self.out_w, self.out_h), Image.BILINEAR)
                 frame = img.quantize(256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)

@@ -7,7 +7,15 @@
       "items": [
         "snip_save",
         "snip_dir",
-        "snip_name",
+        "snip_name"
+      ]
+    },
+    {
+      "id": "editor",
+      "title": "Редактор",
+      "icon": "pen",
+      "items": [
+        "snip_autosave",
         "copy_on_close"
       ]
     },
@@ -40,7 +48,7 @@
       "icon": "settings",
       "items": [
         "tray",
-        "autostart"
+        "autostart", "hk_force"
       ]
     },
     {
@@ -53,8 +61,9 @@
           "section": "Быстрые действия"
         },
         "hk_snip",
+        "hk_quick",
+        "hk_full_edit",
         "hk_gif",
-        "hotkey_silent",
         "shortcuts"
       ]
     }
@@ -66,17 +75,21 @@
     "gif_scale": {
       "description": "Уменьшение размера и веса кадра"
     },
-    "hotkey_silent": {
-      "title": "Показывать окно редактора при быстрых действиях?",
-      "description": "Если вкл, после быстрых действий открывается окно редактора"
-    },
     "hk_snip": {
       "title": "Создать скриншот",
-      "description": "Открывает меню «Создать» для быстрого скриншота"
+      "description": "Открывает меню «Создать», после снимка — редактор"
+    },
+    "hk_quick": {
+      "title": "Скриншот без редактора",
+      "description": "Открывает меню «Создать», снимок сразу в буфер обмена, редактор не открывается"
     },
     "hk_full": {
       "title": "Print Screen",
       "description": "Улучшенная версия кнопки PS: копирует снимок активного монитора даже там, где PS не справляется"
+    },
+    "hk_full_edit": {
+      "title": "Скриншот всего экрана",
+      "description": "Снимает монитор под курсором и сразу открывает снимок в редакторе"
     },
     "hk_gif": {
       "title": "Запись GIF",

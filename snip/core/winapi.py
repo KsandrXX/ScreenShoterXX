@@ -8,6 +8,8 @@ import os
 import sys
 import subprocess
 import threading
+import time
+from xml.sax.saxutils import escape
 
 from PIL import Image
 
@@ -286,6 +288,17 @@ def set_capture_excluded(win, excluded=True):
         return False
 
 
+def set_transitions(win, on):
+    """Анимация Windows при показе и скрытии окна: выключить, чтобы окно исчезло сразу."""
+    try:
+        val = ctypes.c_int(0 if on else 1)
+        dwmapi.DwmSetWindowAttribute(wt.HWND(hwnd_of(win)), DWMWA_TRANSITIONS_FORCEDISABLED,
+                                     ctypes.byref(val), ctypes.sizeof(val))
+    except Exception:
+        pass
+
+
+DWMWA_TRANSITIONS_FORCEDISABLED = 3
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20          # Windows 10 2004+ / 11
 DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19      # Windows 10 1809–1909
 SWP_REFRESH_FRAME = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
@@ -383,6 +396,7 @@ class KeepFrameActive:
 # ---------------------------------------------------------------- слои поверх окна (модальное окно)
 WM_WINDOWPOSCHANGED = 0x0047
 WM_WINDOWPOSCHANGING = 0x0046
+DWMWA_CLOAK = 13
 
 
 class _WINDOWPOS(ctypes.Structure):
@@ -410,6 +424,7 @@ class FrameWatch:
         self.hwnd = hwnd_of(win)
         self.listeners = []
         self._erase = None            # кисть: чем заливать новую (ещё пустую) часть окна
+        self.cloaked = False          # окно разворачивается: скрыто, пока Tk его рисует
         self._old = None
         try:
             self._proc = WNDPROC(self._wndproc)
@@ -424,12 +439,22 @@ class FrameWatch:
             gdi32.DeleteObject(ctypes.c_void_p(self._erase))
         self._erase = gdi32.CreateSolidBrush(_colorref(color)) if color else None
 
+    def cloak(self, on):
+        """Скрыть окно для DWM, не меняя его состояния: Windows и панель задач считают его показанным."""
+        val = ctypes.c_int(1 if on else 0)
+        dwmapi.DwmSetWindowAttribute(wt.HWND(self.hwnd), DWMWA_CLOAK, ctypes.byref(val), ctypes.sizeof(val))
+        self.cloaked = on
+
     def _wndproc(self, hwnd, msg, wp, lp):
         if msg == 0x0014 and self._erase:            # WM_ERASEBKGND
             r = wt.RECT()
             user32.GetClientRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
             user32.FillRect(ctypes.c_void_p(wp), ctypes.byref(r), ctypes.c_void_p(self._erase))
             return 1
+        if msg == WM_WINDOWPOSCHANGING and not self.cloaked and user32.IsIconic(ctypes.c_void_p(hwnd)):
+            # свёрнутое окно разворачивается: DWM уже выбросил его картинку, новая — чёрная,
+            # пока Tk не дорисует (до ~80 мс). Покажет App._restored
+            self.cloak(True)
         if msg == WM_WINDOWPOSCHANGING and self.listeners:
             # ДО того, как Windows применит новый размер: оверлей переезжает в тот же кадр DWM,
             # что и окно (в WM_WINDOWPOSCHANGED он отставал на кадр — полоса по краю, рывки).
@@ -700,27 +725,107 @@ def foreground():
     return user32.GetForegroundWindow()
 
 
-def set_foreground(hwnd):
-    """Вернуть фокус окну hwnd (можно, пока наш процесс — активный)."""
+def set_foreground(hwnd, restore=False):
+    """Вернуть фокус окну hwnd (можно, пока наш процесс — активный). Свёрнутое не трогать: игра на
+    весь экран от фокуса разворачивается сама. restore=True — развернуть (сами свернули: запись из игры)."""
     try:
         if hwnd and user32.IsWindow(hwnd):
+            if user32.IsIconic(hwnd):
+                if not restore:
+                    return
+                user32.ShowWindow(hwnd, 9)          # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
     except Exception:
         pass
+
+
+def next_active_window():
+    """Верхнее чужое окно, которому можно отдать фокус: видимое, с заголовком, НЕ свёрнутое.
+    Нет такого — панель задач."""
+    me = kernel32.GetCurrentProcessId()
+    found = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+    def cb(h, _):
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        cloaked = ctypes.c_int(0)
+        dwmapi.DwmGetWindowAttribute(h, 14, ctypes.byref(cloaked), 4)
+        if (pid.value != me and user32.IsWindowVisible(h) and not user32.IsIconic(h) and not cloaked.value
+                and user32.GetWindowTextLengthW(h) and not user32.GetWindowLongW(h, -20) & 0x80):   # WS_EX_TOOLWINDOW
+            found.append(h)
+            return False
+        return True
+    user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return found[0] if found else user32.FindWindowW("Shell_TrayWnd", None)
+
+
+def hand_off_focus():
+    """Наше окно закрывается или прячется: отдать фокус самим. Иначе его выбирает Windows, и им может
+    стать свёрнутая игра на весь экран — от фокуса она разворачивается сама (B38)."""
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+    if pid.value == kernel32.GetCurrentProcessId():
+        user32.SetForegroundWindow(next_active_window())
+
+
+SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+WS_CAPTION = 0x00C00000
+
+
+def covers_monitor(rect, monitor, style, cls):
+    """Окно — полноэкранная программа: закрывает монитор целиком и без заголовка, не рабочий стол.
+    Развёрнутое обычное окно не подходит: у него есть заголовок."""
+    return (cls not in SHELL_CLASSES and not (style & WS_CAPTION) and rect[0] <= monitor[0] and rect[1] <= monitor[1]
+            and rect[2] >= monitor[2] and rect[3] >= monitor[3])
+
+
+def fullscreen_window(exclude=()):
+    """Активное окно на весь монитор (игра): (x, y, w, h) этого монитора, иначе None."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd or hwnd in exclude:
+        return None
+    r, mi, buf = wt.RECT(), MONITORINFO(), ctypes.create_unicode_buffer(64)
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    _u32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
+    _u32.MonitorFromWindow.restype = HANDLE
+    hmon = _u32.MonitorFromWindow(hwnd, 2)
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)) or not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+        return None
+    user32.GetClassNameW(hwnd, buf, 64)
+    m = mi.rcMonitor
+    if not covers_monitor((r.left, r.top, r.right, r.bottom), (m.left, m.top, m.right, m.bottom),
+                          user32.GetWindowLongW(hwnd, -16), buf.value):
+        return None
+    return m.left, m.top, m.right - m.left, m.bottom - m.top
+
+
+def is_ready(hwnd):
+    """Окно снова активно и не свёрнуто (игра вернулась на экран)."""
+    return user32.GetForegroundWindow() == hwnd and not user32.IsIconic(hwnd)
 
 
 # ---------------------------------------------------------------- одна копия программы
 _instance_mutex = None
 
 
-def single_instance(name):
+def single_instance(name, wait=0):
     """True — это первая копия программы. Именованный мьютекс держится до конца процесса:
-    вторая копия держала бы те же глобальные клавиши, и Windows отдавала бы нажатия ей."""
+    вторая копия держала бы те же глобальные клавиши, и Windows отдавала бы нажатия ей.
+    wait — сколько секунд ждать выхода первой копии (перезапуск с правами администратора)."""
     global _instance_mutex
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = HANDLE
-    _instance_mutex = k32.CreateMutexW(None, False, name)
-    return ctypes.get_last_error() != 183          # ERROR_ALREADY_EXISTS
+    k32.CloseHandle.argtypes = [HANDLE]
+    end = time.time() + wait
+    while True:
+        _instance_mutex = k32.CreateMutexW(None, False, name)
+        if ctypes.get_last_error() != 183:         # ERROR_ALREADY_EXISTS
+            return True
+        if time.time() >= end:
+            return False
+        k32.CloseHandle(_instance_mutex)           # своя ручка держала бы мьютекс и после выхода первой копии
+        time.sleep(0.05)
 
 
 def show_existing(title, skip=()):
@@ -886,6 +991,8 @@ class TrayIcon:
             self._ready.set()
             return
         TrayIcon._instances[self.hwnd] = self
+        for m in (WM_TRAY, TrayIcon._taskbar_created):  # проводник без прав администратора: иначе Windows их не пропустит
+            _u32.ChangeWindowMessageFilterEx(self.hwnd, m, 1, None)
         self._load_icon()
         self._add()
         self._ready.set()
@@ -973,6 +1080,7 @@ class TrayIcon:
         cmd = _u32.TrackPopupMenu(m, 0x0100 | 0x0002 | 0x0080, pt.x, pt.y, 0, self.hwnd, None)
         _u32.PostMessageW(self.hwnd, WM_NULL, 0, 0)   # TPM_RETURNCMD|TPM_RIGHTBUTTON|TPM_NONOTIFY
         _u32.DestroyMenu(m)
+        hand_off_focus()                              # окно значка скрыто: фокус ему больше не нужен
         if cmd == 1:
             self._post("exit")
 
@@ -1044,6 +1152,101 @@ def autostart_remove():
         pass
 
 
+# Запуск от имени администратора (B44): задание планировщика без триггеров. Запись автозапуска и ярлыки остаются
+# обычными, а копия без прав отдаёт запуск заданию (snipper.pyw): окна Windows «Разрешить?» нет, спрашивает один раз
+# только создание задания. Тесты подменяют ADMIN_TASK и пишут задание без наивысших прав.
+ADMIN_TASK = "ScreenshoterXX"
+ADMIN_MARK = "admin_start.txt"            # как запустилась копия без прав: "tray" или "restart"
+_u32.ChangeWindowMessageFilterEx.argtypes = [wt.HWND, wt.UINT, wt.DWORD, ctypes.c_void_p]
+_k32.WaitForSingleObject.argtypes = [HANDLE, wt.DWORD]
+_k32.GetExitCodeProcess.argtypes = [HANDLE, ctypes.POINTER(wt.DWORD)]
+_k32.CloseHandle.argtypes = [HANDLE]
+
+
+class _SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("fMask", wt.ULONG), ("hwnd", wt.HWND), ("lpVerb", wt.LPCWSTR),
+                ("lpFile", wt.LPCWSTR), ("lpParameters", wt.LPCWSTR), ("lpDirectory", wt.LPCWSTR),
+                ("nShow", ctypes.c_int), ("hInstApp", wt.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", wt.LPCWSTR), ("hkeyClass", HANDLE), ("dwHotKey", wt.DWORD), ("hIcon", HANDLE),
+                ("hProcess", HANDLE)]
+
+
+_shell.ShellExecuteExW.argtypes = [ctypes.POINTER(_SHELLEXECUTEINFOW)]
+_shell.ShellExecuteExW.restype = wt.BOOL
+
+
+def program_command(app_dir):
+    """(программа, аргументы) запуска: pythonw без консоли + snipper.pyw, пути в кавычках; у exe — сам exe."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, ""
+    exe = sys.executable
+    w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(w):
+        exe = w
+    return exe, f'"{os.path.join(app_dir, "snipper.pyw")}"'
+
+
+def admin_task_xml(exe, args, app_dir, level="HighestAvailable"):
+    """Без ограничений заданий по умолчанию: они не дают старта от батареи, снимают работу через 3 дня,
+    второй экземпляр не запускают (а он нужен, чтобы показать окно первого) и занижают приоритет."""
+    user = "\\".join(p for p in (os.environ.get("USERDOMAIN"), os.environ.get("USERNAME")) if p)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <UserId>{escape(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>{level}</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{escape(exe)}</Command>
+      <Arguments>{escape(args)}</Arguments>
+      <WorkingDirectory>{escape(app_dir)}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def run_elevated(file, params):
+    """Запустить с правами администратора (окно Windows «Разрешить?»). Дескриптор процесса или None — отказали."""
+    info = _SHELLEXECUTEINFOW(cbSize=ctypes.sizeof(_SHELLEXECUTEINFOW), fMask=0x40, lpVerb="runas",
+                              lpFile=file, lpParameters=params, nShow=0)     # SEE_MASK_NOCLOSEPROCESS, скрыто
+    return info.hProcess if _shell.ShellExecuteExW(ctypes.byref(info)) else None
+
+
+def process_exit(handle):
+    """Код выхода процесса или None — ещё работает."""
+    if _k32.WaitForSingleObject(handle, 0) != 0:
+        return None
+    code = wt.DWORD()
+    _k32.GetExitCodeProcess(handle, ctypes.byref(code))
+    _k32.CloseHandle(handle)
+    return code.value
+
+
+def admin_task_args(xml_path):
+    return f'/create /tn "{ADMIN_TASK}" /xml "{xml_path}" /f'
+
+
+def admin_task_run():
+    """Запустить задание: прав и окна Windows не нужно. False — задания нет."""
+    try:
+        return subprocess.run(["schtasks", "/run", "/tn", ADMIN_TASK], stdin=subprocess.DEVNULL, capture_output=True,
+                              creationflags=subprocess.CREATE_NO_WINDOW, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def open_in_explorer(path):
     try:
         if os.path.isdir(path):
@@ -1068,6 +1271,33 @@ VK_NAMED = {"Print": 0x2C, "Pause": 0x13, "Scroll_Lock": 0x91, "space": 0x20, "I
             "Home": 0x24, "End": 0x23, "Prior": 0x21, "Next": 0x22}
 WM_HOTKEY = 0x0312
 WM_APP_RELOAD = 0x8001
+WM_APP_FIRED = 0x8002
+WH_KEYBOARD_LL = 13
+WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
+KEY_MODS = ((0x11, MOD["Ctrl"]), (0x12, MOD["Alt"]), (0x10, MOD["Shift"]))
+VK_WIN = (0x5B, 0x5C)
+VK_MASK = 0xE8                                    # свободный код: иначе Alt после снятой клавиши откроет меню окна
+VK_MODIFIERS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, VK_MASK}
+VK_SOLO = {0x2C, 0x13, 0x91, *range(0x70, 0x88)}  # назначаются и без модификаторов
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+_u32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wt.HMODULE, wt.DWORD]
+_u32.SetWindowsHookExW.restype = HANDLE
+_u32.UnhookWindowsHookEx.argtypes = [HANDLE]
+_u32.CallNextHookEx.argtypes = [HANDLE, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+_u32.CallNextHookEx.restype = LRESULT
+_u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_u32.GetAsyncKeyState.restype = ctypes.c_short
+_u32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wt.DWORD, ctypes.c_size_t]
+_shell.IsUserAnAdmin.restype = wt.BOOL
+
+
+def shift_held():
+    """Зажат ли Shift сейчас, какое бы окно ни было в фокусе."""
+    return _u32.GetAsyncKeyState(0x10) < 0
+
+
+def is_admin():
+    return bool(_shell.IsUserAnAdmin())
 
 
 def parse_hotkey(text):
@@ -1094,7 +1324,12 @@ def parse_hotkey(text):
 
 class HotkeyService:
     """Глобальные горячие клавиши в отдельном потоке с очередью сообщений.
-    bindings: {id: "Ctrl+Alt+S"}. События кладутся в queue как id."""
+    bindings: {id: "Ctrl+Alt+S"}. События кладутся в queue как id.
+
+    Сильный режим (force, B35): сочетания, которые Windows не приняла, ловит низкоуровневый перехват
+    клавиатуры. Он стоит, только пока такие сочетания есть (и пока идёт запись сочетания). Windows зовёт
+    его на каждую клавишу, поэтому всё, кроме нужных клавиш, отсекается первой же проверкой; колбэк
+    не ждёт главный поток: иначе Windows снимет перехват за медлительность (~0,3 с)."""
 
     def __init__(self, queue, notify=None):
         self.queue = queue
@@ -1102,6 +1337,12 @@ class HotkeyService:
         self.bindings = {}
         self.status = {}
         self.paused = False
+        self.force = False
+        self._hook = None
+        self._proc = HOOKPROC(self._on_key)       # держать ссылку: перехват зовёт её всё время работы
+        self._watch = {}              # {vk: {модификаторы: id}} — что ловит перехват
+        self._record = False          # запись сочетания: занятое до поля не дойдёт, ловим его сами
+        self._held = set()            # снятые клавиши: повтор и отпускание тоже не отдаём
         self.tid = None
         self._ready = threading.Event()
         self._sent = self._done = 0               # номера заказанных и применённых перерегистраций
@@ -1109,9 +1350,10 @@ class HotkeyService:
         threading.Thread(target=self._run, daemon=True).start()
         self._ready.wait(2)
 
-    def update(self, bindings, wait=False):
+    def update(self, bindings, wait=False, force=False):
         """Новые сочетания. wait=True — дождаться регистрации (до 1 с) и вернуть status."""
         self.bindings = dict(bindings)
+        self.force = force
         n = self._poke()
         if wait and n:
             with self._applied:
@@ -1137,16 +1379,68 @@ class HotkeyService:
             user32.UnregisterHotKey(None, i)
         ids.clear()
         self.status = {}
-        if self.paused:
-            return
-        for n, (name, text) in enumerate(sorted(self.bindings.items()), start=1):
+        watch = {}
+        for n, (name, text) in enumerate(sorted(self.bindings.items()) if not self.paused else (), start=1):
             hk = parse_hotkey(text)
             ok = False
             if hk:
                 ok = bool(user32.RegisterHotKey(None, n, hk[0] | MOD_NOREPEAT, hk[1]))
                 if ok:
                     ids[n] = name
+                elif self.force:
+                    watch.setdefault(hk[1], {})[hk[0]] = name
             self.status[name] = ok or not text
+        self._watch, self._record = watch, self.paused and self.force
+        self._set_hook(bool(watch or self._record))
+        for names in watch.values():
+            for name in names.values():
+                self.status[name] = bool(self._hook)
+
+    def _set_hook(self, on):
+        if on and not self._hook:
+            self._hook = _u32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, _k32.GetModuleHandleW(None), 0)
+        elif not on and self._hook:
+            _u32.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+
+    def _on_key(self, code, wp, lp):
+        vk = wt.DWORD.from_address(lp).value      # первое поле KBDLLHOOKSTRUCT
+        if code == 0 and (vk in self._watch or self._record) and self._take(vk, wp in (WM_KEYUP, WM_SYSKEYUP)):
+            return 1
+        return _u32.CallNextHookEx(None, code, wp, lp)
+
+    def _take(self, vk, up):
+        """True — клавишу забираем себе, дальше она не идёт."""
+        if up or vk in self._held:
+            if up and vk in self._held:
+                self._held.discard(vk)
+                return True
+            return not up
+        if any(_u32.GetAsyncKeyState(k) < 0 for k in VK_WIN):
+            return False
+        mods = sum(bit for k, bit in KEY_MODS if _u32.GetAsyncKeyState(k) < 0)
+        if self._record:
+            if vk in VK_MODIFIERS or not mods and vk not in VK_SOLO:
+                return False                      # Esc, Enter, Backspace — полю
+            event = ("hk_caught", mods, vk)
+        else:
+            event = self._watch[vk].get(mods)
+            if event is None:
+                return False
+        self.queue.put(event)
+        self._held.add(vk)
+        if mods & MOD["Alt"]:
+            _u32.keybd_event(VK_MASK, 0, 0, 0)
+            _u32.keybd_event(VK_MASK, 0, 2, 0)
+        user32.PostThreadMessageW(self.tid, WM_APP_FIRED, 0, 0)
+        return True
+
+    def _wake(self):
+        if self.notify:
+            try:
+                self.notify()
+            except Exception:
+                pass                      # главный поток подхватит из очереди по опросу
 
     def _run(self):
         self.tid = kernel32.GetCurrentThreadId()
@@ -1162,8 +1456,6 @@ class HotkeyService:
                     self._applied.notify_all()
             elif msg.message == WM_HOTKEY and int(msg.wParam) in ids:
                 self.queue.put(ids[int(msg.wParam)])
-                if self.notify:
-                    try:
-                        self.notify()
-                    except Exception:
-                        pass              # главный поток подхватит из очереди по опросу
+                self._wake()
+            elif msg.message == WM_APP_FIRED:
+                self._wake()

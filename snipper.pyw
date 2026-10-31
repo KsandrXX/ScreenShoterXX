@@ -7,6 +7,7 @@
 Номера окон (для сообщений о багах): pythonw snipper.pyw --ids — карта номеров в docs/WINDOWS.md
 Конструктор настроек: pythonw snipper.pyw --layout — разложить настройки по разделам и группам,
                    поменять тексты (файл settings_layout.json; настройки в нём — временная копия)
+После обновления:  ScreenShoterXX.exe --updated — подождать, пока старая копия выйдет (B24)
 Сразу в трей:      pythonw snipper.pyw --tray — окно не показывается, если включён «Значок в трее»
                    (так программу запускает автозапуск Windows; без значка окно показывается как обычно)
 
@@ -19,6 +20,7 @@
 программы (для проверки exe рядом с запущенной программой).
 """
 
+import json
 import os
 import sys
 
@@ -45,16 +47,49 @@ def data_dirs():
     return data, None, pics, os.path.join(APP_DIR, "settings_layout.json")
 
 
+from snip.core import winapi as W  # noqa: E402
 from snip.core.winapi import init_process, single_instance, show_existing, message_box  # noqa: E402
 
 init_process("ScreenshoterXX.Snipper")
+
+
+def admin_start():
+    """Запуск от имени администратора (B44). Копия без прав отдаёт запуск заданию планировщика — True, ей пора
+    выйти. Копия с правами читает отметку: откуда её запустили. Вернуть (нужно выйти, сколько ждать первую копию)."""
+    data = data_dirs()[0] or APP_DIR
+    mark = os.path.join(data, W.ADMIN_MARK)
+    if W.is_admin():
+        try:
+            with open(mark, encoding="utf-8") as f:
+                how = f.read()
+            os.remove(mark)
+        except OSError:
+            return False, 0
+        if how == "tray":
+            sys.argv.append("--tray")
+        return False, 5 if how == "restart" else 0
+    try:
+        with open(os.path.join(data, "settings.json"), encoding="utf-8") as f:
+            saved = json.load(f).get("admin_task")
+    except (OSError, ValueError):
+        return False, 0
+    exe, args = W.program_command(APP_DIR)
+    if saved != f"{exe} {args}" or TEST_DATA or "--ids" in sys.argv or "--open" in sys.argv:
+        return False, 0
+    if "--tray" in sys.argv:
+        with open(mark, "w", encoding="utf-8") as f:
+            f.write("tray")
+    if W.admin_task_run():
+        return True, 0
+    if os.path.exists(mark):                        # задание удалили — обычный запуск
+        os.remove(mark)
+    return False, 0
 
 if __name__ == "__main__":
     if "--showcase" in sys.argv:
         from snip.app.showcase import run_showcase
         run_showcase(APP_DIR)
     elif "--layout" in sys.argv:                    # конструктор настроек (B23) — рядом с программой
-        import json
         import shutil
         import tempfile
         from snip.app.main import App
@@ -74,7 +109,10 @@ if __name__ == "__main__":
                  gif_dir=os.path.join(tmp, "gif"), settings_page=d.get("settings_page", "capture"))
         json.dump(d, open(sp, "w", encoding="utf-8"), ensure_ascii=False)
         App(APP_DIR, sp, layout_path=os.path.join(APP_DIR, LayoutStore.FILE), layout_edit=True).run()
-    elif single_instance("ScreenshoterXX.Snipper.Instance" + (".Test" if TEST_DATA else "")):
+    elif (start := admin_start())[0]:
+        pass
+    elif single_instance("ScreenshoterXX.Snipper.Instance" + (".Test" if TEST_DATA else ""),
+                         15 if "--updated" in sys.argv else start[1]):
         from snip.app.main import App
         if "--ids" in sys.argv:                     # режим проверки: номер на каждом окне (docs/WINDOWS.md)
             from snip.app.winmap import WINDOW_IDS
@@ -86,6 +124,17 @@ if __name__ == "__main__":
         app = App(APP_DIR, hidden="--tray" in sys.argv, data_dir=data, media_dir=media, media_root=media_root,
                   layout_path=layout)
         app.sync_autostart()                        # запись автозапуска: путь верный (папку могли перенести)
+        if FROZEN:
+            from snip.core import updater
+
+            def tidy(tries=12):
+                if not updater.cleanup(sys.executable) and tries:
+                    app.root.after(app.th.timing("update_cleanup"), tidy, tries - 1)
+            app.root.after(app.th.timing("update_cleanup"), tidy)
+            if TEST_DATA and os.environ.get("SCREENSHOTER_UPDATE_API"):   # проверка exe: update_exe_check.py
+                updater.API = os.environ["SCREENSHOTER_UPDATE_API"]
+                if "--updated" not in sys.argv:
+                    app.root.after(app.th.timing("update_settle"), app.updater.start)
         if "--open" in sys.argv[:-1]:               # --open картинка.png — сразу в редактор (для проверок)
             from PIL import Image
             app.load_image(Image.open(sys.argv[sys.argv.index("--open") + 1]))
